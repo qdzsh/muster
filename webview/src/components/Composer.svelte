@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { thread } from '../lib/turn-state.svelte';
+  import { thread, resolveBackendForSend } from '../lib/turn-state.svelte';
   import { post } from '../lib/protocol';
 
   // vscode-textarea is a custom element exposing a `.value` property.
@@ -9,7 +9,9 @@
     if (thread.running || !textareaEl) return;
     const value = (textareaEl.value ?? '').trim();
     if (!value) return;
-    post({ type: 'send', text: value, backend: thread.backend });
+    const backend = resolveBackendForSend();
+    thread.setBackend(backend);
+    post({ type: 'send', text: value, backend });
     textareaEl.value = '';
   }
 
@@ -29,7 +31,7 @@
   <vscode-textarea
     bind:this={textareaEl}
     rows={3}
-    placeholder="Message Claude…  (Enter to send, Shift+Enter for newline)"
+    placeholder={`Message ${thread.backend}…  (Enter to send, Shift+Enter for newline)`}
     disabled={thread.running}
     onkeydown={onKeydown}
     style="width: 100%;"

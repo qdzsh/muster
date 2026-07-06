@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
 import { ClaudeBackend } from './backends/claude';
 import { makeBackend } from './backends/index';
+import { disposeSharedAcpClient } from './backends/acp-client';
 import { RunOptions } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -96,13 +97,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       options.cwd = wsFolder.uri.fsPath;
     }
 
-    if (state.lastSessionId) {
-      options.resumeId = state.lastSessionId;
-    } else if (!state.suppressFileResume) {
+    // Resume only an in-memory session from this extension host run. No file restore
+    // on send — first message after restart always starts fresh for that backend.
+    if (_continueLast) {
       const wsSession = this._loadSessionId(backend.name);
       if (wsSession) options.resumeId = wsSession;
+    } else if (state.lastSessionId) {
+      options.resumeId = state.lastSessionId;
     }
-    state.suppressFileResume = false;
 
     let stagedSessionId: string | undefined;
 
@@ -288,4 +290,6 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-export function deactivate() {}
+export function deactivate() {
+  disposeSharedAcpClient();
+}

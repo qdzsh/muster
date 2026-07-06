@@ -10,10 +10,17 @@ export type NormalizedEvent =
   | { type: 'error'; message: string; isCancellation?: boolean; raw?: unknown; meta?: Record<string, unknown> }
   | { type: 'raw'; line: string };
 
+/** ACP `session/new` / `session/load` MCP entry (http/sse only over ACP). */
+export type McpServerConfig =
+  | { type: 'http'; name: string; url: string; headers?: { name: string; value: string }[] }
+  | { type: 'sse'; name: string; url: string; headers?: { name: string; value: string }[] };
+
 export interface RunOptions {
   prompt: string;
   resumeId?: string;
   mcpConfigPath?: string;
+  /** Per-session MCP injection for ACP backends (empty by default). */
+  mcpServers?: McpServerConfig[];
   cwd?: string;
   extraEnv?: Record<string, string>;
   signal?: AbortSignal;

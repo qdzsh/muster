@@ -1,4 +1,4 @@
-import { GrokBackend } from '../src/backends/grok';
+import { GrokBackend, disposeSharedAcpClient } from '../src/backends/grok';
 import { runTurn } from '../src/runner';
 
 async function main() {
@@ -25,6 +25,7 @@ async function main() {
 
   let failed = false;
 
+  try {
   for await (const event of runTurn(backend, options)) {
     if (event.type === 'reasoningDelta') {
       process.stdout.write(`\x1b[2m${event.content}\x1b[0m`);
@@ -43,6 +44,9 @@ async function main() {
     } else if (event.type === 'raw') {
       console.log(`\n[raw] ${event.line}`);
     }
+  }
+  } finally {
+    disposeSharedAcpClient();
   }
 
   if (failed) {

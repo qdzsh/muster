@@ -46,6 +46,18 @@ class ThreadState {
   sessionId = $state<string | undefined>(undefined);
   backend = $state('claude');
 
+  /** Drop session badge when switching backends — no pre-bound session. */
+  clearSessionIdentity(): void {
+    this.sessionId = undefined;
+  }
+
+  setBackend(next: 'claude' | 'grok'): void {
+    if (this.backend !== next) {
+      this.clearSessionIdentity();
+    }
+    this.backend = next;
+  }
+
   reset(): void {
     this.items = [];
     this.streaming = null;
@@ -140,3 +152,16 @@ class ThreadState {
 }
 
 export const thread = new ThreadState();
+
+let backendSelectEl: (HTMLElement & { value: string }) | undefined;
+
+export function registerBackendSelect(el: (HTMLElement & { value: string }) | undefined): void {
+  backendSelectEl = el;
+}
+
+/** Read the dropdown at send time so the chosen backend drives the turn. */
+export function resolveBackendForSend(): 'claude' | 'grok' {
+  const fromSelect = backendSelectEl?.value;
+  if (fromSelect === 'claude' || fromSelect === 'grok') return fromSelect;
+  return thread.backend === 'grok' ? 'grok' : 'claude';
+}

@@ -1,180 +1,263 @@
 import { randomUUID } from 'crypto';
-import { spawn } from 'child_process';
-import { createInterface } from 'readline';
-import { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
+import { Backend, BackendCapabilities, McpServerConfig, NormalizedEvent, RunOptions } from '../types';
+import { PromptResult, SessionUpdate, disposeSharedAcpClient, getSharedAcpClient } from './acp-client';
 
-// Least-permissive mode verified noninteractively (edit + shell, grok 0.2.87).
-// TODO: promote to muster.grok.permissionMode setting.
-const GROK_PERMISSION_MODE = 'default';
+export { disposeSharedAcpClient };
 
-// Verified: grok honors --session-id with a pre-assigned v4 UUID.
-const USE_PREASSIGNED_SESSION_ID = true;
+const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens']);
 
-const FAILURE_STOP_REASONS = new Set(['Error', 'Refusal']);
+function resolveMcpServers(options: RunOptions): McpServerConfig[] {
+  // Injection point for the future Muster Bridge (Phase C).
+  return options.mcpServers ?? [];
+}
+
+function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedEvent | undefined {
+  const kind = update.sessionUpdate as string | undefined;
+
+  switch (kind) {
+    case 'agent_thought_chunk': {
+      const text = (update.content as { text?: string } | undefined)?.text;
+      if (typeof text === 'string' && text.length > 0) {
+        return { type: 'reasoningDelta', content: text, messageId };
+      }
+      return { type: 'raw', line: JSON.stringify(update) };
+    }
+    case 'agent_message_chunk': {
+      const text = (update.content as { text?: string } | undefined)?.text;
+      if (typeof text === 'string' && text.length > 0) {
+        return { type: 'assistantDelta', content: text, messageId };
+      }
+      return { type: 'raw', line: JSON.stringify(update) };
+    }
+    case 'user_message_chunk':
+    case 'available_commands_update':
+      return undefined;
+    case 'tool_call': {
+      const toolCallId = typeof update.toolCallId === 'string' ? `grok:${update.toolCallId}` : undefined;
+      const name = typeof update.title === 'string' ? update.title : 'tool';
+      if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
+      const meta = update._meta as Record<string, unknown> | undefined;
+      const toolMeta = meta?.['x.ai/tool'] as { kind?: string } | undefined;
+      const kindHint = toolMeta?.kind;
+      return {
+        type: 'toolStarted',
+        toolCallId,
+        name,
+        kind: kindHint === 'mcp' ? 'mcp' : 'builtin',
+        input: update.rawInput,
+        meta,
+      };
+    }
+    case 'tool_call_update': {
+      const toolCallId = typeof update.toolCallId === 'string' ? `grok:${update.toolCallId}` : undefined;
+      if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
+      const meta = update._meta as Record<string, unknown> | undefined;
+      const statusRaw =
+        typeof update.status === 'string'
+          ? update.status
+          : (meta?.updateParams as { status?: string } | undefined)?.status;
+      const status = statusRaw?.toLowerCase();
+      if (status === 'completed' || status === 'failed') {
+        const content = update.content as unknown[] | undefined;
+        const textBlock = Array.isArray(content)
+          ? content.find((c) => (c as { type?: string }).type === 'content') as
+              | { content?: { type?: string; text?: string } }
+              | undefined
+          : undefined;
+        const outputText = textBlock?.content?.text;
+        if (status === 'failed') {
+          return {
+            type: 'toolCompleted',
+            toolCallId,
+            outcome: 'error',
+            error: outputText ?? 'Tool failed',
+            meta,
+          };
+        }
+        return {
+          type: 'toolCompleted',
+          toolCallId,
+          outcome: 'success',
+          output: outputText,
+          meta,
+        };
+      }
+      return {
+        type: 'toolUpdated',
+        toolCallId,
+        input: update.rawInput,
+        meta,
+      };
+    }
+    default:
+      return { type: 'raw', line: JSON.stringify(update) };
+  }
+}
+
+function usageFromMeta(meta?: Record<string, unknown>): NormalizedEvent | undefined {
+  if (!meta) return undefined;
+  const usage: Record<string, unknown> = {};
+  for (const key of [
+    'totalTokens',
+    'inputTokens',
+    'outputTokens',
+    'cachedReadTokens',
+    'reasoningTokens',
+    'modelId',
+  ]) {
+    if (meta[key] !== undefined) usage[key] = meta[key];
+  }
+  if (Object.keys(usage).length === 0) return undefined;
+  return { type: 'usage', usage, meta };
+}
+
+function terminalFromPrompt(
+  result: PromptResult,
+  cancelled: boolean,
+): NormalizedEvent {
+  if (cancelled) {
+    return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+  }
+
+  const stopReason = result.stopReason;
+  if (stopReason === 'cancelled') {
+    return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+  }
+  if (typeof stopReason !== 'string' || stopReason.length === 0) {
+    return { type: 'error', message: 'Grok prompt ended without a stopReason' };
+  }
+  if (FAILURE_STOP_REASONS.has(stopReason)) {
+    return { type: 'error', message: `Grok stopped: ${stopReason}` };
+  }
+  if (stopReason !== 'end_turn') {
+    return { type: 'error', message: `Grok stopped: ${stopReason}`, meta: { stopReason } };
+  }
+  return { type: 'turnCompleted', meta: { stopReason } };
+}
+
+function cancellationTerminal(): NormalizedEvent {
+  return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+}
 
 export class GrokBackend implements Backend {
   readonly name = 'grok';
   readonly capabilities: BackendCapabilities = {
     supportsReasoning: true,
-    supportsDetailedToolEvents: false,
-    supportsMCP: false,
+    supportsDetailedToolEvents: true,
+    supportsMCP: true,
   };
 
   async *run(options: RunOptions): AsyncIterable<NormalizedEvent> {
     const messageId = randomUUID();
-    const args: string[] = [
-      '-p',
-      options.prompt,
-      '--output-format',
-      'streaming-json',
-      '--permission-mode',
-      GROK_PERMISSION_MODE,
-    ];
-
-    let expectedSessionId: string | undefined;
-
-    if (options.resumeId) {
-      args.push('--resume', options.resumeId);
-      expectedSessionId = options.resumeId;
-      yield { type: 'sessionStarted', sessionId: options.resumeId };
-    } else if (USE_PREASSIGNED_SESSION_ID) {
-      const sid = randomUUID();
-      args.push('--session-id', sid);
-      expectedSessionId = sid;
-      yield { type: 'sessionStarted', sessionId: sid };
-    }
-
     const cwd = options.cwd || process.cwd();
-    const env = { ...process.env, ...options.extraEnv };
+    const mcpServers = resolveMcpServers(options);
+    const client = getSharedAcpClient();
 
-    const child = spawn('grok', args, {
-      cwd,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let spawnError: Error | undefined;
-    const closed = new Promise<number | null>((resolve) => {
-      child.once('close', (code) => resolve(code));
-      child.once('error', (e) => {
-        spawnError = e;
-        resolve(null);
-      });
-    });
-
+    let activeSessionId: string | undefined;
+    let unregister: (() => void) | undefined;
+    let unregisterConnection: (() => void) | undefined;
     let cancelled = false;
+
+    const isAborted = () => cancelled || !!options.signal?.aborted;
+
     const onAbort = () => {
       cancelled = true;
-      child.kill('SIGTERM');
+      if (activeSessionId) client.cancel(activeSessionId);
     };
+
+    if (isAborted()) {
+      yield cancellationTerminal();
+      return;
+    }
+
     options.signal?.addEventListener('abort', onAbort);
-    if (options.signal?.aborted) onAbort();
 
-    let stderr = '';
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    const rl = createInterface({ input: child.stdout! });
-
-    let endSeen = false;
-    let stopReason: string | undefined;
-    let endSessionId: string | undefined;
+    const pendingUpdates: NormalizedEvent[] = [];
+    const bufferUpdate = (update: SessionUpdate) => {
+      const mapped = mapSessionUpdate(update, messageId);
+      if (mapped) pendingUpdates.push(mapped);
+    };
+    const bufferConnectionLine = (line: string, source: 'stderr' | 'non-json') => {
+      const prefix = source === 'stderr' ? '[stderr] ' : '[acp] ';
+      pendingUpdates.push({ type: 'raw', line: prefix + line });
+    };
 
     try {
-      for await (const line of rl) {
-        if (cancelled) break;
-        if (!line.trim()) continue;
+      unregisterConnection = client.registerConnectionSink(bufferConnectionLine);
 
-        try {
-          const obj = JSON.parse(line) as {
-            type?: string;
-            data?: unknown;
-            stopReason?: string;
-            sessionId?: string;
-          };
+      await client.ensureConnected(options.extraEnv);
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
 
-          if (obj.type === 'thought' && typeof obj.data === 'string') {
-            yield { type: 'reasoningDelta', content: obj.data, messageId };
-          } else if (obj.type === 'text' && typeof obj.data === 'string') {
-            yield { type: 'assistantDelta', content: obj.data, messageId };
-          } else if (obj.type === 'end') {
-            // A well-formed `end` must carry a string stopReason + sessionId. Anything
-            // else is malformed → raw, and we do NOT accept it as a terminal marker: the
-            // post-close check then reports an incomplete turn instead of a false success
-            // (which would otherwise commit a session Grok never confirmed).
-            if (typeof obj.stopReason === 'string' && typeof obj.sessionId === 'string') {
-              endSeen = true;
-              stopReason = obj.stopReason;
-              endSessionId = obj.sessionId;
-              if (expectedSessionId && obj.sessionId !== expectedSessionId) {
-                yield {
-                  type: 'raw',
-                  line: `[session-id mismatch] expected ${expectedSessionId}, got ${obj.sessionId}: ${line}`,
-                };
-              }
-              if (obj.stopReason !== 'EndTurn' && !FAILURE_STOP_REASONS.has(obj.stopReason)) {
-                yield { type: 'raw', line };
-              }
-            } else {
-              yield { type: 'raw', line };
-            }
-          } else {
-            yield { type: 'raw', line };
-          }
-        } catch {
-          yield { type: 'raw', line };
+      if (options.resumeId) {
+        if (!client.loadSessionSupported) {
+          yield { type: 'error', message: 'Grok agent does not support session resume' };
+          return;
         }
+        const loaded = await client.loadSession(options.resumeId, cwd, mcpServers);
+        activeSessionId = loaded.sessionId;
+        if (isAborted()) {
+          yield cancellationTerminal();
+          return;
+        }
+        yield { type: 'sessionStarted', sessionId: activeSessionId };
+        unregister = client.registerSessionSink(activeSessionId, bufferUpdate);
+      } else {
+        const created = await client.newSession(cwd, mcpServers);
+        activeSessionId = created.sessionId;
+        if (isAborted()) {
+          yield cancellationTerminal();
+          return;
+        }
+        yield { type: 'sessionStarted', sessionId: activeSessionId };
+        unregister = client.registerSessionSink(activeSessionId, bufferUpdate);
+      }
+
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
+
+      const promptPromise = client.prompt(activeSessionId, options.prompt);
+
+      while (true) {
+        while (pendingUpdates.length > 0) {
+          yield pendingUpdates.shift()!;
+        }
+
+        const race = await Promise.race([
+          promptPromise.then((r) => ({ kind: 'done' as const, result: r })),
+          new Promise<{ kind: 'tick' }>((resolve) => setTimeout(() => resolve({ kind: 'tick' }), 50)),
+        ]);
+
+        if (race.kind === 'tick') continue;
+
+        while (pendingUpdates.length > 0) {
+          yield pendingUpdates.shift()!;
+        }
+
+        const usageEvent = usageFromMeta(race.result._meta);
+        if (usageEvent) yield usageEvent;
+        yield terminalFromPrompt(race.result, isAborted());
+        return;
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isAborted()) {
+        yield cancellationTerminal();
+      } else if (message.includes('Run `grok login`') || message.includes('Failed to start')) {
+        yield { type: 'error', message };
+      } else if (message.includes('Grok agent exited') || message.includes('not running')) {
+        yield { type: 'error', message };
+      } else {
+        yield { type: 'error', message: `Grok ACP error: ${message}` };
       }
     } finally {
       options.signal?.removeEventListener('abort', onAbort);
+      unregister?.();
+      unregisterConnection?.();
     }
-
-    const exitCode = await closed;
-
-    if (stderr.trim()) {
-      for (const line of stderr.trim().split('\n')) {
-        yield { type: 'raw', line: `[stderr] ${line}` };
-      }
-    }
-
-    if (cancelled || options.signal?.aborted) {
-      yield { type: 'error', message: 'Turn cancelled', isCancellation: true };
-      return;
-    }
-
-    if (spawnError) {
-      yield { type: 'error', message: `Failed to start grok: ${spawnError.message}` };
-      return;
-    }
-
-    if (exitCode !== null && exitCode !== 0) {
-      yield { type: 'error', message: `Grok exited with code ${exitCode}` };
-      return;
-    }
-
-    if (!endSeen) {
-      yield { type: 'error', message: 'Grok stream ended without an end event' };
-      return;
-    }
-
-    if (stopReason && FAILURE_STOP_REASONS.has(stopReason)) {
-      yield { type: 'error', message: `Grok stopped: ${stopReason}` };
-      return;
-    }
-
-    if (!USE_PREASSIGNED_SESSION_ID && !options.resumeId && endSessionId) {
-      yield { type: 'sessionStarted', sessionId: endSessionId };
-    }
-
-    yield { type: 'turnCompleted', meta: stopReason ? { stopReason } : undefined };
-  }
-
-  extractSessionId(rawOutput: string, lastUsedId?: string): string | undefined {
-    const matches = [...rawOutput.matchAll(/"sessionId":"([0-9a-f-]+)"/gi)];
-    if (matches.length > 0) {
-      return matches[matches.length - 1][1];
-    }
-    return lastUsedId;
   }
 }

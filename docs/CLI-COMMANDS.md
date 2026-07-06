@@ -97,75 +97,58 @@ In `stream-json` mode the first event is a system/init event carrying `session_i
 
 ## Grok
 
-### Basic headless
+**Muster adapter:** ACP (`grok --no-auto-update agent stdio`) — one shared agent process, one ACP session per turn. Reference: `study/grok-build-vscode-src`.
+
+### ACP lifecycle (verified 0.2.87)
+
 ```bash
-grok -p "your prompt here"      # -p is short for --single
+grok --no-auto-update agent stdio   # JSON-RPC 2.0, newline-delimited stdin/stdout
 ```
 
-### Streaming
+1. `initialize { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }`
+2. `authenticate { methodId, _meta: { headless: true } }` — `xai.api_key` if `XAI_API_KEY` set, else `cached_token`
+3. New turn: `session/new { cwd, mcpServers: [] }` → `sessionId` (emit `sessionStarted` immediately)
+4. Resume: `session/load { sessionId, cwd, mcpServers: [] }` (replays a few history updates — adapter registers sink **after** load completes)
+5. Turn: `session/prompt { sessionId, prompt: [{ type: "text", text }] }` → `{ stopReason, _meta }` (sole terminal signal)
+6. Cancel: `session/cancel` **notification** (no `id`) — `stopReason: "cancelled"`
+
+### `session/update` → NormalizedEvent (verified 0.2.87)
+
+| `sessionUpdate` | Maps to |
+|---|---|
+| `agent_thought_chunk` | `reasoningDelta` |
+| `agent_message_chunk` | `assistantDelta` |
+| `tool_call` / `tool_call_update` | `toolStarted` / `toolUpdated` / `toolCompleted` |
+| `user_message_chunk`, `available_commands_update` | ignored |
+| other | `raw` |
+
+`stopReason` observed: `end_turn` (success), `cancelled` (cancellation). Map `refusal` / `error` / `max_tokens` to adapter `error`.
+
+### MCP injection (ACP)
+
+Per-session `mcpServers` on `session/new` / `session/load`. **stdio MCP is rejected** over ACP; use http/sse entries:
+
+```json
+{ "type": "http", "name": "muster_bridge", "url": "http://127.0.0.1:<port>/mcp", "headers": [] }
+```
+
+File-based discovery (`~/.grok/config.toml`, `.mcp.json`) still loads inside sessions — injection is additive.
+
+### Server→client requests (Muster posture)
+
+- `session/request_permission` → auto-allow (non-interactive; parity with headless `--always-approve`)
+- `fs/*`, `terminal/*` → unsupported (capabilities declared off; Grok uses built-in tools)
+- `_x.ai/*` extension notifications (no `id`) → ignored
+
+### Headless alternative (`grok -p`) — not used by Muster
+
+Still available for scripts:
+
 ```bash
-grok -p "your prompt here" --output-format streaming-json
+grok -p "prompt" --output-format streaming-json
 ```
 
-`--output-format` values: `plain` (default) | `json` | `streaming-json`.
-
-### Resume
-```bash
-grok -p "continue" --resume <session-id>
-# or
-grok -p "continue" --continue    # most recent session for this cwd (use with care)
-```
-
-`--fork-session` is available when resuming (optionally combined with `--session-id` to name the fork).
-
-### New session with pre-generated ID
-```bash
-grok -p "..." --session-id <uuid>   # new conversations only; must be a fresh UUID
-```
-
-### MCP
-No per-invocation MCP config flag (verified 0.2.82 — nothing like Claude's `--mcp-config`). Grok discovers MCP servers from:
-- `.mcp.json` in the working directory
-- Global config, managed via `grok mcp add/list/remove/doctor`
-
-For MVP:
-- **Option A (preferred)**: write a temp `.mcp.json` into the spawn `cwd` (or a dedicated cwd) before the turn.
-- **Option B**: one-time `grok mcp add context_engine ...` global registration.
-
-`grok mcp doctor` is useful when debugging discovery/connectivity.
-
-### `streaming-json` event shapes (verified 0.2.87)
-
-NDJSON — one JSON object per line. Only three event types observed in headless mode:
-
-```jsonl
-{"type":"thought","data":"The"}                 // reasoning, token-by-token
-{"type":"text","data":"hello"}                  // assistant answer, token-by-token
-{"type":"end","stopReason":"EndTurn","sessionId":"<uuid>","requestId":"<uuid>"}
-```
-
-- `thought` = reasoning deltas; `text` = assistant deltas (concatenate `data` chunks).
-- `end` is the **only** terminal marker; `sessionId` appears **only** in `end` (after content).
-- **No structured tool events** in headless `streaming-json` — tool activity is internal to Grok.
-- `--session-id <uuid>` is honored for new sessions (v4 UUID verified).
-- `stopReason` observed: `EndTurn` (success). Map `Error`/`Refusal` to adapter errors if seen.
-- Permission mode `default` completes noninteractively for edit + shell turns (least-permissive verified).
-
-### Notes
-- `--max-turns <N>` exists as a safety rail.
-
-### Alternative: ACP mode (`grok agent stdio`) — proven, but long-lived
-
-`~/projects/grok-implement/skill-packs/grok-implement/scripts/grok-runner.js` is a working reference that drives Grok via **ACP** (JSON-RPC 2.0 over stdio, newline-delimited) instead of headless `-p`:
-
-- Handshake: `initialize` (protocolVersion 1, client capabilities fs/terminal) → `authenticate` (`xai.api_key` if `XAI_API_KEY` set, else `cached_token`) → `session/new { cwd, mcpServers: [...] }` → returns `sessionId`.
-- **MCP servers are passed programmatically in `session/new`** — no `.mcp.json` temp file needed at all.
-- Send a turn: `session/prompt { sessionId, prompt: [{type:"text", text}] }` → resolves with `{ stopReason }`.
-- Streaming: `session/update` notifications, discriminated by `update.sessionUpdate`: `agent_message_chunk`, `agent_thought_chunk` (token-by-token — buffer before rendering), `tool_call`, `tool_call_update` (carries `toolCallId`, `title`, `kind`, `status`, `rawInput`, `rawOutput`, `locations`) — maps almost 1:1 onto our NormalizedEvent model.
-- Cancel: `session/cancel` notification (cooperative, with kill-tree fallback after a grace period).
-- ⚠️ The client **must answer server-initiated requests**: `session/request_permission` (headless → auto-approve policy), `fs/read_text_file`, `fs/write_text_file`, `terminal/*`.
-
-**Trade-off**: ACP requires keeping the `grok agent stdio` process alive across turns, which conflicts with our per-turn-spawn principle (DESIGN.md §2.1). For MVP stick with headless `-p --output-format streaming-json`; treat ACP as the fallback if headless streaming-json turns out to lack tool/reasoning fidelity, and as the authoritative reference for what Grok events look like.
+Headless emits only `thought` / `text` / `end` NDJSON — no structured tool events. Muster migrated to ACP for per-session MCP injection and richer streaming.
 
 ---
 
@@ -407,7 +390,7 @@ agy -p "..." --log-file /tmp/agy-turn.log           # debug log (also shown in T
 | CLI | Headless | Streaming | Resume | New session w/ own ID | MCP injection | Permission policy | Streaming quality |
 |-----|----------|-----------|--------|----------------------|---------------|-------------------|-------------------|
 | Claude | `-p` | `--output-format stream-json --include-partial-messages --verbose` | `--resume <id>` | `--session-id <uuid>` | `--mcp-config <file\|json> --strict-mcp-config` | `--permission-mode` / `--allowedTools` | Excellent |
-| Grok | `-p` (`--single`) | `--output-format streaming-json` | `--resume <id>` | `--session-id <uuid>` | `.mcp.json` in cwd or `grok mcp add` | `--permission-mode` / `--allow` | Good |
+| Grok | `agent stdio` (ACP) | `session/update` notifications | `session/load <id>` | server-assigned via `session/new` | `mcpServers` on `session/new` (http/sse) | auto-allow `session/request_permission` | Excellent |
 | Codex | `exec` | `--json` | `exec resume <id> "prompt"` | — | `-c mcp_servers.*` overrides | `--sandbox <mode>` | Good |
 | Antigravity | `-p` | `--output-format json` (single blob; no NDJSON yet) | `--conversation <id>` | — (CLI assigns `conversation_id`) | `~/.gemini/config/mcp_config.json` (file-based) | `--dangerously-skip-permissions` / `--sandbox` / `settings.json` rules | Weak / experimental |
 
@@ -416,7 +399,7 @@ agy -p "..." --log-file /tmp/agy-turn.log           # debug log (also shown in T
 ## Recommendations for MVP
 
 1. Implement **Claude** first — best combination of streaming + explicit MCP support.
-2. Implement **Grok** second — same headless/resume/session-id shape as Claude, only MCP injection differs.
+2. Implement **Grok** second — ACP (`grok agent stdio`); per-session `mcpServers` injection.
 3. Add **Codex**.
 4. Add **Antigravity** last (treat as bonus/experimental).
 
@@ -440,8 +423,8 @@ Two battle-tested runners in sibling projects already solve process management (
 ## Open items to verify empirically
 
 - [x] ~~Exact event shape carrying the session/thread ID in `codex exec --json`~~ → `{"type":"thread.started","thread_id":...}` (confirmed by codex-runner.js).
-- [ ] Event shapes for reasoning + MCP tool calls in Grok **headless** `streaming-json` (ACP shapes are known — see above — but the `-p` path needs its own check).
+- [x] Grok ACP `session/update` shapes (reasoning, tools, cancel) — verified 0.2.87; Muster adapter uses ACP.
 - [x] ~~Antigravity headless JSON output + session ID~~ → `--output-format json` (hidden flag); `conversation_id` in single stdout JSON blob; `status`/`error`/`usage` confirmed on 1.0.16. **No** `--json` alias. `streaming-json`/`ndjson`/etc. not implemented yet.
 - [x] ~~Location of Antigravity MCP config~~ → primary path `~/.gemini/config/mcp_config.json`; permissions in `~/.gemini/antigravity-cli/settings.json`; project overrides in `~/.gemini/config/projects/<id>.json`.
 - [ ] Whether agy will add NDJSON/streaming tool events in a future release (re-check `--help` + `--output-format` values on upgrade).
-- [ ] Whether Grok picks up a freshly written `.mcp.json` in `cwd` at spawn time (Option A) — moot if we adopt ACP later.
+- [x] Grok per-session MCP via ACP `mcpServers` — http schema `{ type, name, url, headers }` verified; stdio rejected.

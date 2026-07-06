@@ -1,15 +1,25 @@
 <script lang="ts">
-  import { thread } from '../lib/turn-state.svelte';
+  import { thread, registerBackendSelect } from '../lib/turn-state.svelte';
   import { post } from '../lib/protocol';
 
   function newSession() {
     post({ type: 'newSession', backend: thread.backend });
   }
 
-  function onBackendChange(e: Event) {
-    const el = e.currentTarget as HTMLElement & { value: string };
-    thread.backend = el.value;
+  // vscode-single-select dispatches input+change; bind:value keeps thread.backend in sync.
+  let backendSelect: (HTMLElement & { value: string }) | undefined;
+
+  function syncBackendFromSelect(e: Event) {
+    const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
+    const next = el?.value;
+    if (next === 'claude' || next === 'grok') {
+      thread.setBackend(next);
+    }
   }
+
+  $effect(() => {
+    registerBackendSelect(backendSelect);
+  });
 
   const shortId = $derived(thread.sessionId ? thread.sessionId.slice(0, 8) : null);
 </script>
@@ -21,10 +31,12 @@
   <span class="font-semibold">Muster</span>
 
   <vscode-single-select
+    bind:this={backendSelect}
     value={thread.backend}
     title="Backend"
     disabled={thread.running}
-    onchange={onBackendChange}
+    onchange={syncBackendFromSelect}
+    oninput={syncBackendFromSelect}
   >
     <vscode-option value="claude">Claude</vscode-option>
     <vscode-option value="grok">Grok</vscode-option>

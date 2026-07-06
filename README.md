@@ -13,13 +13,13 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 
 | Feature | Status |
 |---------|--------|
-| Headless per-turn CLI spawn | ✅ |
+| Headless per-turn CLI spawn (Claude) | ✅ |
 | Claude `stream-json` adapter | ✅ (basic) |
 | Session resume (explicit ID) | ✅ |
 | Webview chat | ✅ (minimal) |
 | MCP context engine injection | 🔜 |
 | MCP `ask_user` (Muster Bridge) | 🔜 — [design](docs/MUSTER-BRIDGE.md) |
-| Grok `streaming-json` adapter | ✅ (basic) |
+| Grok ACP adapter (`grok agent stdio`) | ✅ (basic) |
 | Codex / agy backends | 🔜 |
 
 ## Prerequisites
