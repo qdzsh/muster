@@ -18,18 +18,78 @@ export interface PromptResult {
 type SessionSink = (update: SessionUpdate) => void;
 type ConnectionSink = (line: string, source: 'stderr' | 'non-json') => void;
 
-let sharedClient: AcpClient | undefined;
-
-export function getSharedAcpClient(): AcpClient {
-  if (!sharedClient) {
-    sharedClient = new AcpClient();
-  }
-  return sharedClient;
+/** Shape of the ACP `initialize` response fields the client relies on. */
+export interface AcpInitializeResult {
+  authMethods?: { id: string }[];
+  agentCapabilities?: { loadSession?: boolean };
 }
 
+/** Auth choice returned by a backend's {@link AcpAgentConfig.resolveAuth}. */
+export interface AcpAuthChoice {
+  methodId: string;
+  meta?: Record<string, unknown>;
+}
+
+/**
+ * Backend-specific configuration for a shared ACP agent connection.
+ * The client itself is backend-agnostic; everything CLI-specific
+ * (spawn command, auth strategy, extension handling, labels) lives here.
+ */
+export interface AcpAgentConfig {
+  /** Stable key used to deduplicate shared clients (usually the backend name). */
+  key: string;
+  /** Human-readable label used in error messages, e.g. 'Grok', 'Kiro'. */
+  label: string;
+  /** Executable to spawn. */
+  command: string;
+  /** Arguments for the ACP stdio agent, e.g. ['agent', 'stdio'] or ['acp']. */
+  args: string[];
+  /** Client capabilities advertised on `initialize` (defaults to fs/terminal off). */
+  clientCapabilities?: Record<string, unknown>;
+  /**
+   * Decide how to authenticate given the `initialize` result and env.
+   * Return `null`/`undefined` to skip the `authenticate` step entirely
+   * (e.g. agents that use cached login credentials transparently).
+   * Throw to fail the connection with a helpful, user-facing message.
+   */
+  resolveAuth?: (
+    init: AcpInitializeResult,
+    env: NodeJS.ProcessEnv,
+  ) => AcpAuthChoice | null | undefined;
+  /**
+   * Optional handler for backend-specific server→client requests (ACP
+   * extensions). Return `{ result }` to answer the request; return
+   * `undefined` to fall through to the default acknowledgement.
+   */
+  extensionRequestHandler?: (
+    method: string,
+    params: Record<string, unknown>,
+  ) => { result?: unknown } | undefined;
+}
+
+const DEFAULT_CLIENT_CAPABILITIES: Record<string, unknown> = {
+  fs: { readTextFile: false, writeTextFile: false },
+  terminal: false,
+};
+
+const sharedClients = new Map<string, AcpClient>();
+
+/** Get (or lazily create) the shared ACP client for a backend config. */
+export function getSharedAcpClient(config: AcpAgentConfig): AcpClient {
+  let client = sharedClients.get(config.key);
+  if (!client) {
+    client = new AcpClient(config);
+    sharedClients.set(config.key, client);
+  }
+  return client;
+}
+
+/** Dispose every shared ACP client (called on extension deactivate). */
 export function disposeSharedAcpClient(): void {
-  sharedClient?.dispose();
-  sharedClient = undefined;
+  for (const client of sharedClients.values()) {
+    client.dispose();
+  }
+  sharedClients.clear();
 }
 
 export class AcpClient {
@@ -43,6 +103,8 @@ export class AcpClient {
   private extraEnv?: Record<string, string>;
   private authenticated = false;
   loadSessionSupported = false;
+
+  constructor(private readonly config: AcpAgentConfig) {}
 
   registerSessionSink(sessionId: string, sink: SessionSink): () => void {
     let sinks = this.sessionSinks.get(sessionId);
@@ -89,7 +151,7 @@ export class AcpClient {
   ): Promise<{ sessionId: string }> {
     await this.ensureConnected();
     if (!this.loadSessionSupported) {
-      throw new Error('Grok agent does not support session/load');
+      throw new Error(`${this.config.label} agent does not support session/load`);
     }
     await this.request('session/load', { sessionId, cwd, mcpServers });
     return { sessionId };
@@ -111,7 +173,7 @@ export class AcpClient {
   dispose(): void {
     this.teardownProcess();
     this.connectPromise = undefined;
-    this.rejectAllPending(new Error('ACP client disposed'));
+    this.rejectAllPending(new Error(`${this.config.label} ACP client disposed`));
     this.sessionSinks.clear();
     this.connectionSinks.clear();
   }
@@ -147,7 +209,7 @@ export class AcpClient {
     this.teardownProcess();
 
     const env = this.mergedEnv();
-    const proc = spawn('grok', ['--no-auto-update', 'agent', 'stdio'], {
+    const proc = spawn(this.config.command, this.config.args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
     });
@@ -171,7 +233,7 @@ export class AcpClient {
       this.proc = undefined;
       this.authenticated = false;
       this.connectPromise = undefined;
-      this.rejectAllPending(new Error(`Grok agent exited (code ${code})`));
+      this.rejectAllPending(new Error(`${this.config.label} agent exited (code ${code})`));
     });
 
     proc.on('error', (err) => {
@@ -183,30 +245,20 @@ export class AcpClient {
     try {
       const init = (await this.request('initialize', {
         protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-        },
-      })) as {
-        authMethods?: { id: string }[];
-        agentCapabilities?: { loadSession?: boolean };
-      };
+        clientCapabilities: this.config.clientCapabilities ?? DEFAULT_CLIENT_CAPABILITIES,
+      })) as AcpInitializeResult;
 
       this.loadSessionSupported = !!init.agentCapabilities?.loadSession;
 
-      const authMethods = new Set((init.authMethods ?? []).map((m) => m.id));
-      const methodId =
-        env.XAI_API_KEY && authMethods.has('xai.api_key')
-          ? 'xai.api_key'
-          : authMethods.has('cached_token')
-            ? 'cached_token'
-            : null;
-
-      if (!methodId) {
-        throw new Error('Run `grok login` first, or set XAI_API_KEY.');
+      if (this.config.resolveAuth) {
+        const choice = this.config.resolveAuth(init, env);
+        if (choice) {
+          await this.request('authenticate', {
+            methodId: choice.methodId,
+            _meta: choice.meta ?? {},
+          });
+        }
       }
-
-      await this.request('authenticate', { methodId, _meta: { headless: true } });
       this.authenticated = true;
     } catch (err) {
       this.teardownProcess();
@@ -235,7 +287,7 @@ export class AcpClient {
 
       if (!this.writeLine({ jsonrpc: '2.0', id, method, params })) {
         this.pending.delete(id);
-        reject(new Error(`Grok agent is not running (${method})`));
+        reject(new Error(`${this.config.label} agent is not running (${method})`));
         return;
       }
 
@@ -337,20 +389,12 @@ export class AcpClient {
         return;
       }
 
-      if (
-        method === 'x.ai/ask_user_question' ||
-        method === '_x.ai/ask_user_question'
-      ) {
-        this.respondOk(id, { outcome: 'cancelled' });
-        return;
-      }
-
-      if (
-        method === 'x.ai/exit_plan_mode' ||
-        method === '_x.ai/exit_plan_mode'
-      ) {
-        this.respondOk(id, { outcome: 'approved' });
-        return;
+      if (this.config.extensionRequestHandler) {
+        const handled = this.config.extensionRequestHandler(method, params);
+        if (handled) {
+          this.respondOk(id, handled.result ?? {});
+          return;
+        }
       }
 
       // Unknown server request — ack so the agent does not hang.

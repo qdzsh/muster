@@ -1,6 +1,9 @@
 import type { SnapshotMessage, TaskSummary } from './protocol';
 import { isTerminalStatus } from './protocol';
 
+/** Backends selectable from the webview toolbar. */
+export type WebviewBackendId = 'claude' | 'grok' | 'kiro';
+
 class TasksState {
   /** All known tasks keyed by id (roots + subtree entries from snapshots/patches). */
   tasks = $state<Map<string, TaskSummary>>(new Map());
@@ -17,7 +20,7 @@ class TasksState {
   /** Set when opening "Continue as new task" from a terminal thread. */
   continuationOf = $state<string | null>(null);
 
-  selectedBackend = $state<'claude' | 'grok'>('claude');
+  selectedBackend = $state<WebviewBackendId>('claude');
 
   commandError = $state<string | null>(null);
 
@@ -40,7 +43,7 @@ class TasksState {
     return task ? isTerminalStatus(task.viewStatus) : false;
   }
 
-  setBackend(next: 'claude' | 'grok'): void {
+  setBackend(next: WebviewBackendId): void {
     this.selectedBackend = next;
   }
 
@@ -141,8 +144,8 @@ export function registerBackendSelect(el: (HTMLElement & { value: string }) | un
 }
 
 /** Read the dropdown at send time so the chosen backend drives new-task creation. */
-export function resolveBackendForSend(): 'claude' | 'grok' {
+export function resolveBackendForSend(): WebviewBackendId {
   const fromSelect = backendSelectEl?.value;
-  if (fromSelect === 'claude' || fromSelect === 'grok') return fromSelect;
-  return tasks.selectedBackend === 'grok' ? 'grok' : 'claude';
+  if (fromSelect === 'claude' || fromSelect === 'grok' || fromSelect === 'kiro') return fromSelect;
+  return tasks.selectedBackend;
 }

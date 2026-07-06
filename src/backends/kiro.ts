@@ -10,43 +10,48 @@ import {
 
 export { disposeSharedAcpClient };
 
-const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens']);
+/** stopReasons that represent a failed (non-cancellation) turn. */
+const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens', 'max_turn_requests']);
 
-/** Shared ACP agent configuration for the Grok CLI (`grok agent stdio`). */
-export const GROK_AGENT_CONFIG: AcpAgentConfig = {
-  key: 'grok',
-  label: 'Grok',
-  command: 'grok',
-  args: ['--no-auto-update', 'agent', 'stdio'],
+/**
+ * Shared ACP agent configuration for the Kiro CLI (`kiro-cli acp`).
+ *
+ * Kiro authenticates transparently using cached login credentials
+ * (`kiro-cli login`) or `KIRO_API_KEY`, so it typically advertises no ACP
+ * `authMethods` and no explicit `authenticate` step is required. If a future
+ * Kiro build does advertise auth methods, we pick a sensible one.
+ */
+export const KIRO_AGENT_CONFIG: AcpAgentConfig = {
+  key: 'kiro',
+  label: 'Kiro',
+  command: 'kiro-cli',
+  args: ['acp'],
   resolveAuth: (init, env) => {
-    const authMethods = new Set((init.authMethods ?? []).map((m) => m.id));
-    const methodId =
-      env.XAI_API_KEY && authMethods.has('xai.api_key')
-        ? 'xai.api_key'
-        : authMethods.has('cached_token')
-          ? 'cached_token'
-          : null;
-    if (!methodId) {
-      throw new Error('Run `grok login` first, or set XAI_API_KEY.');
+    const methods = init.authMethods ?? [];
+    if (methods.length === 0) {
+      // No auth handshake needed — Kiro uses cached credentials / KIRO_API_KEY.
+      return null;
     }
-    return { methodId, meta: { headless: true } };
-  },
-  extensionRequestHandler: (method) => {
-    if (method === 'x.ai/ask_user_question' || method === '_x.ai/ask_user_question') {
-      return { result: { outcome: 'cancelled' } };
+    const ids = methods.map((m) => m.id);
+    const apiKeyMethod = ids.find((id) => /api[_-]?key/i.test(id));
+    if (env.KIRO_API_KEY && apiKeyMethod) {
+      return { methodId: apiKeyMethod, meta: { headless: true } };
     }
-    if (method === 'x.ai/exit_plan_mode' || method === '_x.ai/exit_plan_mode') {
-      return { result: { outcome: 'approved' } };
-    }
-    return undefined;
+    const cachedMethod = ids.find((id) => /cached|token|login|sso|builder/i.test(id));
+    return { methodId: cachedMethod ?? ids[0], meta: { headless: true } };
   },
 };
 
 function resolveMcpServers(options: RunOptions): McpServerConfig[] {
-  // Injection point for the future Muster Bridge (Phase C).
   return options.mcpServers ?? [];
 }
 
+/**
+ * Map a Kiro ACP `session/update` to a NormalizedEvent.
+ * Kiro implements standard ACP, so update kinds arrive in snake_case
+ * (`agent_message_chunk`, `tool_call`, ...). Unknown shapes fall back to
+ * `raw` to preserve debuggability if the wire format evolves.
+ */
 function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedEvent | undefined {
   const kind = update.sessionUpdate as string | undefined;
 
@@ -67,25 +72,24 @@ function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedE
     }
     case 'user_message_chunk':
     case 'available_commands_update':
+      // Echo/noise with no diagnostic value (matches the Grok reference).
       return undefined;
     case 'tool_call': {
-      const toolCallId = typeof update.toolCallId === 'string' ? `grok:${update.toolCallId}` : undefined;
+      const toolCallId = typeof update.toolCallId === 'string' ? `kiro:${update.toolCallId}` : undefined;
       const name = typeof update.title === 'string' ? update.title : 'tool';
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
-      const toolMeta = meta?.['x.ai/tool'] as { kind?: string } | undefined;
-      const kindHint = toolMeta?.kind;
       return {
         type: 'toolStarted',
         toolCallId,
         name,
-        kind: kindHint === 'mcp' ? 'mcp' : 'builtin',
+        kind: isMcpTool(update) ? 'mcp' : 'builtin',
         input: update.rawInput,
         meta,
       };
     }
     case 'tool_call_update': {
-      const toolCallId = typeof update.toolCallId === 'string' ? `grok:${update.toolCallId}` : undefined;
+      const toolCallId = typeof update.toolCallId === 'string' ? `kiro:${update.toolCallId}` : undefined;
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
       const statusRaw =
@@ -94,13 +98,7 @@ function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedE
           : (meta?.updateParams as { status?: string } | undefined)?.status;
       const status = statusRaw?.toLowerCase();
       if (status === 'completed' || status === 'failed') {
-        const content = update.content as unknown[] | undefined;
-        const textBlock = Array.isArray(content)
-          ? content.find((c) => (c as { type?: string }).type === 'content') as
-              | { content?: { type?: string; text?: string } }
-              | undefined
-          : undefined;
-        const outputText = textBlock?.content?.text;
+        const outputText = extractToolOutput(update.content);
         if (status === 'failed') {
           return {
             type: 'toolCompleted',
@@ -130,6 +128,26 @@ function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedE
   }
 }
 
+/** Best-effort MCP-vs-builtin classification for a Kiro tool call. */
+function isMcpTool(update: SessionUpdate): boolean {
+  const meta = update._meta as Record<string, unknown> | undefined;
+  const metaKind = (meta?.['kiro.dev/tool'] as { kind?: string } | undefined)?.kind;
+  if (metaKind === 'mcp') return true;
+  // ACP tool `kind` is a category (read/edit/execute/...), not the provider.
+  // Kiro MCP tools are conventionally named "<server>___<tool>".
+  const rawName = typeof update.toolName === 'string' ? update.toolName : undefined;
+  return typeof rawName === 'string' && rawName.includes('___');
+}
+
+/** Pull the first text block out of an ACP tool_call_update `content` array. */
+function extractToolOutput(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const textBlock = content.find((c) => (c as { type?: string }).type === 'content') as
+    | { content?: { type?: string; text?: string } }
+    | undefined;
+  return textBlock?.content?.text;
+}
+
 function usageFromMeta(meta?: Record<string, unknown>): NormalizedEvent | undefined {
   if (!meta) return undefined;
   const usage: Record<string, unknown> = {};
@@ -147,10 +165,7 @@ function usageFromMeta(meta?: Record<string, unknown>): NormalizedEvent | undefi
   return { type: 'usage', usage, meta };
 }
 
-function terminalFromPrompt(
-  result: PromptResult,
-  cancelled: boolean,
-): NormalizedEvent {
+function terminalFromPrompt(result: PromptResult, cancelled: boolean): NormalizedEvent {
   if (cancelled) {
     return { type: 'error', message: 'Turn cancelled', isCancellation: true };
   }
@@ -160,13 +175,13 @@ function terminalFromPrompt(
     return { type: 'error', message: 'Turn cancelled', isCancellation: true };
   }
   if (typeof stopReason !== 'string' || stopReason.length === 0) {
-    return { type: 'error', message: 'Grok prompt ended without a stopReason' };
+    return { type: 'error', message: 'Kiro prompt ended without a stopReason' };
   }
   if (FAILURE_STOP_REASONS.has(stopReason)) {
-    return { type: 'error', message: `Grok stopped: ${stopReason}` };
+    return { type: 'error', message: `Kiro stopped: ${stopReason}` };
   }
   if (stopReason !== 'end_turn') {
-    return { type: 'error', message: `Grok stopped: ${stopReason}`, meta: { stopReason } };
+    return { type: 'error', message: `Kiro stopped: ${stopReason}`, meta: { stopReason } };
   }
   return { type: 'turnCompleted', meta: { stopReason } };
 }
@@ -175,8 +190,8 @@ function cancellationTerminal(): NormalizedEvent {
   return { type: 'error', message: 'Turn cancelled', isCancellation: true };
 }
 
-export class GrokBackend implements Backend {
-  readonly name = 'grok';
+export class KiroBackend implements Backend {
+  readonly name = 'kiro';
   readonly capabilities: BackendCapabilities = {
     supportsReasoning: true,
     supportsDetailedToolEvents: true,
@@ -187,7 +202,7 @@ export class GrokBackend implements Backend {
     const messageId = randomUUID();
     const cwd = options.cwd || process.cwd();
     const mcpServers = resolveMcpServers(options);
-    const client = getSharedAcpClient(GROK_AGENT_CONFIG);
+    const client = getSharedAcpClient(KIRO_AGENT_CONFIG);
 
     let activeSessionId: string | undefined;
     let unregister: (() => void) | undefined;
@@ -229,7 +244,7 @@ export class GrokBackend implements Backend {
 
       if (options.resumeId) {
         if (!client.loadSessionSupported) {
-          yield { type: 'error', message: 'Grok agent does not support session resume' };
+          yield { type: 'error', message: 'Kiro agent does not support session resume' };
           return;
         }
         const loaded = await client.loadSession(options.resumeId, cwd, mcpServers);
@@ -283,12 +298,12 @@ export class GrokBackend implements Backend {
       const message = err instanceof Error ? err.message : String(err);
       if (isAborted()) {
         yield cancellationTerminal();
-      } else if (message.includes('Run `grok login`') || message.includes('Failed to start')) {
+      } else if (message.includes('Run `kiro-cli login`') || message.includes('Failed to start')) {
         yield { type: 'error', message };
-      } else if (message.includes('Grok agent exited') || message.includes('not running')) {
+      } else if (message.includes('Kiro agent exited') || message.includes('not running')) {
         yield { type: 'error', message };
       } else {
-        yield { type: 'error', message: `Grok ACP error: ${message}` };
+        yield { type: 'error', message: `Kiro ACP error: ${message}` };
       }
     } finally {
       options.signal?.removeEventListener('abort', onAbort);
