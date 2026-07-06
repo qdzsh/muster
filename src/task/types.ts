@@ -83,12 +83,33 @@ export interface TaskMessage {
   createdAt: string;
   turnId?: string;
 }
+export interface OpResult {
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+}
+
+export interface CancelRequest {
+  kind: 'interrupt' | 'cancel';
+  by: string;
+  opId: string;
+  at: string;
+}
+
+export interface OperationLedgerEntry {
+  fingerprint: string;
+  result: OpResult;
+}
+
 export interface TaskStoreFile {
   schemaVersion: number;
   revision: number;
   tasks: Record<string, MusterTask>;
   turns: Record<string, TaskTurn>;
   messages: Record<string, TaskMessage>;
+  /** Phase C coordination state (schema ≥ 2). */
+  operations?: Record<string, OperationLedgerEntry>;
+  cancelRequests?: Record<string, CancelRequest>;
 }
 
 // Derived view status (§4.3) — computed, never persisted

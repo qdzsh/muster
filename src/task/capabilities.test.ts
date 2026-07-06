@@ -1,0 +1,24 @@
+import { describe, expect, it } from 'vitest';
+import { capabilitiesFor } from './capabilities';
+
+describe('capabilitiesFor', () => {
+  it('grants coordinator actions from capabilities', () => {
+    const caps = capabilitiesFor({
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    expect(caps.has('create_task')).toBe(true);
+    expect(caps.has('delegate_task')).toBe(true);
+    expect(caps.has('wait_for_tasks')).toBe(true);
+    expect(caps.has('get_task_status')).toBe(true);
+    expect(caps.has('ask_user')).toBe(true);
+    expect(caps.has('interrupt_task')).toBe(false);
+  });
+
+  it('grants only any-task actions to workers', () => {
+    const caps = capabilitiesFor({ role: 'worker', capabilities: ['create_child'] });
+    expect(caps.has('create_task')).toBe(false);
+    expect(caps.has('complete_task')).toBe(true);
+    expect(caps.has('ask_user')).toBe(true);
+  });
+});

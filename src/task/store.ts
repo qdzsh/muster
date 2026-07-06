@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 import { deriveViewStatus } from './derived-status';
 import type { MusterTask, TaskLifecycleState, TaskMessage, TaskStoreFile, TaskTurn, TaskViewStatus } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export interface StoreOptions {
   filePath: string;
@@ -25,13 +25,18 @@ interface LockRecord {
 }
 
 function emptyEnvelope(schemaVersion: number): TaskStoreFile {
-  return {
+  const base: TaskStoreFile = {
     schemaVersion,
     revision: 0,
     tasks: {},
     turns: {},
     messages: {},
   };
+  if (schemaVersion >= 2) {
+    base.operations = {};
+    base.cancelRequests = {};
+  }
+  return base;
 }
 
 function cloneFile(file: TaskStoreFile): TaskStoreFile {
@@ -78,6 +83,12 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
   while (current.schemaVersion < targetVersion) {
     if (current.schemaVersion === 0) {
       current.schemaVersion = 1;
+      continue;
+    }
+    if (current.schemaVersion === 1) {
+      current.schemaVersion = 2;
+      current.operations = current.operations ?? {};
+      current.cancelRequests = current.cancelRequests ?? {};
       continue;
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);

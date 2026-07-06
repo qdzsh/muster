@@ -72,12 +72,12 @@
     "mvp:claude": "tsx scripts/test-runner.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
     "mvp:task": "tsx scripts/test-task.ts",
+    "mvp:bridge": "tsx scripts/test-bridge.ts",
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tailwindcss/vite": "^4.3.2",
     "@types/node": "^26.1.0",
@@ -91,6 +91,7 @@
     "vitest": "4.1.10"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@vscode-elements/elements": "^2.5.1"
   }
 }

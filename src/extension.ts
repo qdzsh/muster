@@ -1,11 +1,21 @@
 import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
+import { AskBridge } from './bridge/ask-bridge';
+import { CredentialRegistry } from './bridge/credentials';
+import { MusterBridgeServer } from './bridge/server';
 import { ClaudeBackend } from './backends/claude';
 import { makeBackend } from './backends/index';
 import { disposeSharedAcpClient } from './backends/acp-client';
 import { RunOptions } from './types';
+import { TaskEngine } from './task/engine';
+import { TaskStore } from './task/store';
 import * as fs from 'fs';
 import * as path from 'path';
+
+let askBridge: AskBridge | undefined;
+let credentialRegistry: CredentialRegistry | undefined;
+let bridgeServer: MusterBridgeServer | undefined;
+let taskEngine: TaskEngine | undefined;
 
 interface BackendSessionState {
   lastSessionId?: string;
@@ -68,6 +78,34 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           state.suppressFileResume = true;
           this._clearSessionId(backend);
           webviewView.webview.postMessage({ type: 'sessionReset' });
+          break;
+        }
+        case 'submitAsk': {
+          if (
+            typeof data.taskId === 'string' &&
+            typeof data.turnId === 'string' &&
+            typeof data.askId === 'string' &&
+            data.answers
+          ) {
+            taskEngine?.submitAskAnswer(
+              { taskId: data.taskId, turnId: data.turnId, askId: data.askId },
+              data.answers,
+            );
+          }
+          break;
+        }
+        case 'cancelAsk': {
+          if (
+            typeof data.taskId === 'string' &&
+            typeof data.turnId === 'string' &&
+            typeof data.askId === 'string'
+          ) {
+            taskEngine?.cancelAskTurn({
+              taskId: data.taskId,
+              turnId: data.turnId,
+              askId: data.askId,
+            });
+          }
           break;
         }
       }
@@ -208,7 +246,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 }
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
   const provider = new MusterChatProvider(context.extensionUri);
 
   context.subscriptions.push(
@@ -220,6 +258,63 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.commands.executeCommand('workbench.view.extension.muster');
     }),
   );
+
+  try {
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    const storePath = wsFolder
+      ? path.join(wsFolder.uri.fsPath, '.muster-tasks.json')
+      : path.join(context.globalStorageUri.fsPath, '.muster-tasks.json');
+
+    askBridge = new AskBridge({
+      onRegister: (ref, questions) => {
+        provider['_view']?.webview.postMessage({
+          type: 'askPending',
+          taskId: ref.taskId,
+          turnId: ref.turnId,
+          askId: ref.askId,
+          questions,
+        });
+      },
+    });
+    credentialRegistry = new CredentialRegistry();
+    bridgeServer = new MusterBridgeServer({
+      credentials: credentialRegistry,
+      toolHandler: {
+        handleToolCall: async (ctx, _tool, args) => {
+          if (!taskEngine) {
+            return { ok: false, error: 'task engine not ready' };
+          }
+          return taskEngine.handleToolCall(ctx, _tool, args as import('./task/coordinator-tools').ToolCommand);
+        },
+      },
+    });
+    const { port } = await bridgeServer.listen();
+    const store = TaskStore.load({ filePath: storePath });
+    taskEngine = TaskEngine.load({
+      store,
+      makeBackend,
+      askBridge,
+      credentialRegistry,
+      bridgePort: port,
+    });
+    context.subscriptions.push({
+      dispose: () => {
+        void bridgeServer?.close();
+        askBridge?.cancelAll('deactivate');
+        credentialRegistry?.revokeAll();
+      },
+    });
+  } catch (error) {
+    void bridgeServer?.close();
+    askBridge?.cancelAll('init failed');
+    credentialRegistry?.revokeAll();
+    bridgeServer = undefined;
+    askBridge = undefined;
+    credentialRegistry = undefined;
+    taskEngine = undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Muster task engine disabled: ${message}`);
+  }
 
   context.subscriptions.push(
     vscode.commands.registerCommand('muster.sendToClaude', async () => {
@@ -291,5 +386,8 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  askBridge?.cancelAll('deactivate');
+  credentialRegistry?.revokeAll();
+  void bridgeServer?.close();
   disposeSharedAcpClient();
 }

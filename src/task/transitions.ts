@@ -458,6 +458,63 @@ export function retryTurn(
   });
 }
 
+export function cancelPendingTurn(
+  turn: TaskTurn,
+  options: { now: string },
+): TransitionResult<TaskTurn> {
+  if (turn.status === 'queued' || LIVE_TURN_STATUSES.has(turn.status)) {
+    return {
+      ok: true,
+      next: {
+        ...turn,
+        status: 'cancelled',
+        finishedAt: options.now,
+        disposition: undefined,
+      },
+      effects: LIVE_TURN_STATUSES.has(turn.status) ? [{ kind: 'cancelProcess' }] : [],
+    };
+  }
+  return { ok: false, reason: 'turn is not pending' };
+}
+
+export function applyDependencyTerminal(
+  task: MusterTask,
+  pendingTurn: TaskTurn | undefined,
+  outcome: 'failed' | 'skipped',
+  options: { now: string; error?: string },
+): TransitionResult<{ task: MusterTask; turn?: TaskTurn }> {
+  if (isTerminalLifecycle(task.lifecycle)) {
+    return { ok: false, reason: 'task is already terminal' };
+  }
+
+  const terminalTask = bumpTask(task, options.now, {
+    lifecycle: outcome,
+    finishedAt: options.now,
+    ...(outcome === 'failed' ? { error: options.error ?? 'dependency unsatisfied' } : {}),
+  });
+
+  let settledTurn: TaskTurn | undefined;
+  const effects: Effect[] = [];
+  if (pendingTurn) {
+    const ownership = rejectUnlessTurnBelongsToTask(task, pendingTurn);
+    if (ownership) {
+      return ownership;
+    }
+    const cancelled = cancelPendingTurn(pendingTurn, { now: options.now });
+    if (!cancelled.ok) {
+      return cancelled;
+    }
+    settledTurn = cancelled.next;
+    effects.push(...cancelled.effects);
+  }
+
+  return {
+    ok: true,
+    next: { task: terminalTask, turn: settledTurn },
+    effects,
+  };
+}
+
 export function cancelTask(
   task: MusterTask,
   options: { liveTurn?: TaskTurn; now: string },

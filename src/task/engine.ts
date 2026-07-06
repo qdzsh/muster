@@ -1,10 +1,26 @@
 import { randomBytes, randomUUID } from 'crypto';
 import * as fs from 'fs';
+import type { Answers, AskRef } from '../bridge/ask-bridge';
+import { AskBridge } from '../bridge/ask-bridge';
+import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
+import {
+  buildRunOptionsForTurn,
+  cleanupTurnResources,
+  executeToolCommand,
+  processCancelRequests,
+  pruneLedgerForTurn,
+  projectChildResults,
+  tryPromoteTurn,
+  type GraphEngineDeps,
+} from './engine-graph';
+import type { ToolCommand } from './coordinator-tools';
+import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
+import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
 import {
@@ -15,10 +31,13 @@ import {
   retryCountOf,
   retryTurn,
   resolveChildWait,
+  submitAnswer,
   stageDisposition,
   startProcess,
   startTask as transitionStartTask,
   continueTask as transitionContinueTask,
+  applyDependencyTerminal,
+  cancelPendingTurn,
   cancelTask as transitionCancelTask,
   isTerminalLifecycle,
   type CreateTaskInput,
@@ -49,6 +68,10 @@ export interface TaskEngineConfig {
   runTurn?: (backend: Backend, options: RunOptions) => AsyncIterable<NormalizedEvent>;
   dispositionLimits?: DispositionLimits;
   clock?: () => string;
+  askBridge?: AskBridge;
+  credentialRegistry?: CredentialRegistry;
+  bridgePort?: number;
+  resourceLimits?: ResourceLimits;
 }
 
 export type EngineResult<T> =
@@ -145,9 +168,16 @@ function leaseOwnerAlive(storePath: string, turnId: string): boolean {
   return !isProcessDead(existing.pid);
 }
 
+function ownsLocalLease(storePath: string, turnId: string): boolean {
+  const existing = readLockRecord(leasePath(storePath, turnId));
+  return existing?.pid === process.pid;
+}
+
 export function projectPrompt(
   turn: TaskTurn,
   messages: ReadonlyMap<string, TaskMessage>,
+  file?: TaskStoreFile,
+  maxChildResultBytes = 16_384,
 ): string {
   const parts: string[] = [];
   const messageInputs = turn.inputs
@@ -167,9 +197,11 @@ export function projectPrompt(
         parts.push(input.instruction);
         break;
       case 'child_results':
-        parts.push(
-          ['[child_results]', ...input.taskIds.map((id) => `- ${id}`)].join('\n'),
-        );
+        if (file) {
+          parts.push(projectChildResults(input.taskIds, file, maxChildResultBytes));
+        } else {
+          parts.push(['[child_results]', ...input.taskIds.map((id) => `- ${id}`)].join('\n'));
+        }
         break;
       default: {
         const _exhaustive: never = input;
@@ -241,9 +273,14 @@ export class TaskEngine {
   private readonly limits: DispositionLimits;
   private readonly clock?: () => string;
   private readonly storePath: string;
+  private readonly askBridge: AskBridge;
+  private readonly credentialRegistry?: CredentialRegistry;
+  private readonly bridgePort: number;
+  private readonly resourceLimits: ResourceLimits;
   private readonly liveRuns = new Map<string, AbortController>();
   private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
+  private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
   private settling = new Set<string>();
 
   private constructor(config: TaskEngineConfig, storePath: string) {
@@ -253,6 +290,98 @@ export class TaskEngine {
     this.limits = config.dispositionLimits ?? DEFAULT_LIMITS;
     this.clock = config.clock;
     this.storePath = storePath;
+    this.askBridge = config.askBridge ?? new AskBridge();
+    this.credentialRegistry = config.credentialRegistry;
+    this.bridgePort = config.bridgePort ?? 0;
+    this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+  }
+
+  private graphDeps(): GraphEngineDeps {
+    const credentials = this.credentialRegistry ?? new CredentialRegistry();
+    return {
+      store: this.store,
+      makeBackend: this.makeBackend,
+      credentials,
+      askBridge: this.askBridge,
+      bridgePort: this.bridgePort,
+      resourceLimits: this.resourceLimits,
+      clock: this.clock,
+      liveRuns: this.liveRuns,
+      pendingAskPromises: this.pendingAskPromises,
+      onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
+      leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
+      ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
+      writeCancelRequest: (turnId, kind, by, opId) => {
+        this.store.commit((draft) => {
+          draft.cancelRequests = draft.cancelRequests ?? {};
+          draft.cancelRequests[turnId] = { kind, by, opId, at: nowIso(this.clock) };
+          return { ok: true };
+        });
+      },
+    };
+  }
+
+  submitAskAnswer(ref: AskRef, answers: Answers): EngineResult<void> {
+    if (!this.askBridge.hasPending(ref)) {
+      return { ok: false, reason: 'no matching pending ask' };
+    }
+    const commit = this.store.commit((draft) => {
+      const turn = draft.turns[ref.turnId];
+      if (!turn || turn.status !== 'waiting_user') {
+        return { ok: false, reason: 'turn is not waiting for user' };
+      }
+      const resumed = submitAnswer(turn);
+      if (!resumed.ok) return resumed;
+      draft.turns[ref.turnId] = resumed.next;
+      return { ok: true };
+    });
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    if (!this.askBridge.submit(ref, answers)) {
+      return { ok: false, reason: 'ask disappeared before submit' };
+    }
+    return { ok: true, value: undefined };
+  }
+
+  cancelAskTurn(ref: AskRef): EngineResult<void> {
+    if (!this.askBridge.hasPending(ref)) {
+      return { ok: false, reason: 'no matching pending ask' };
+    }
+    this.liveRuns.get(ref.turnId)?.abort();
+    const now = nowIso(this.clock);
+    const commit = this.store.commit((draft) => {
+      const turn = draft.turns[ref.turnId];
+      if (!turn) return { ok: false, reason: 'turn not found' };
+      if (turn.status === 'running' || turn.status === 'waiting_user') {
+        const interrupted = interruptTurn(turn, { now });
+        if (!interrupted.ok) return interrupted;
+        draft.turns[ref.turnId] = interrupted.next;
+      }
+      return { ok: true };
+    });
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    this.askBridge.cancel(ref, 'turn cancelled');
+    return { ok: true, value: undefined };
+  }
+
+  async handleToolCall(
+    ctx: import('../bridge/credentials').CredentialContext,
+    _tool: string,
+    command: ToolCommand,
+  ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
+    return executeToolCommand(
+      this.graphDeps(),
+      {
+        callerTaskId: ctx.callerTaskId,
+        turnId: ctx.turnId,
+        rootId: ctx.rootId,
+        allowedActions: ctx.allowedActions,
+      },
+      command,
+    );
   }
 
   static load(config: TaskEngineConfig): TaskEngine {
@@ -340,6 +469,10 @@ export class TaskEngine {
       };
 
       if (viewStatus === 'idle') {
+        const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+        if (!turnCap.ok) {
+          return turnCap;
+        }
         const turns = turnsForTask(draft, taskId);
         const turnId = randomUUID();
         const queue =
@@ -388,6 +521,10 @@ export class TaskEngine {
       if (isTerminalLifecycle(task.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
       }
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        return turnCap;
+      }
       const result = transitionStartTask(task, turnsForTask(draft, taskId), { turnId, now, inputs });
       if (!result.ok) {
         return result;
@@ -415,6 +552,10 @@ export class TaskEngine {
       }
       if (isTerminalLifecycle(task.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
+      }
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        return turnCap;
       }
       const result = transitionContinueTask(task, turnsForTask(draft, taskId), { turnId, now, inputs });
       if (!result.ok) {
@@ -555,9 +696,58 @@ export class TaskEngine {
         return { ok: true };
       });
       this.acceptedOpIds.delete(turn.id);
+      this.askBridge.cancelForTurn(turn.id, 'reload interrupt');
+      this.credentialRegistry?.revoke(turn.id);
     }
 
     this.reconcileChildWaits();
+    this.reconcileTaskTimeouts();
+    processCancelRequests(this.graphDeps());
+  }
+
+  private reconcileTaskTimeouts(): void {
+    const deps = this.graphDeps();
+    const now = nowIso(this.clock);
+    const nowMs = Date.parse(now);
+    for (const task of Object.values(this.store.getFile().tasks)) {
+      if (isTerminalLifecycle(task.lifecycle)) continue;
+      const turns = this.store.getTurnsForTask(task.id);
+      const firstStarted = turns.find((t) => t.startedAt)?.startedAt;
+      if (!firstStarted) continue;
+      if (nowMs - Date.parse(firstStarted) <= task.executionPolicy.taskTimeoutMs) continue;
+      const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
+      const remoteLeased =
+        live &&
+        deps.leaseOwnerAlive(live.id) &&
+        !deps.ownsLease(live.id);
+      if (remoteLeased) {
+        deps.writeCancelRequest(live.id, 'cancel', 'engine', `task-timeout-${task.id}`);
+        continue;
+      }
+      if (live) this.liveRuns.get(live.id)?.abort();
+      this.store.commit((draft) => {
+        const draftTask = draft.tasks[task.id];
+        if (!draftTask || isTerminalLifecycle(draftTask.lifecycle)) return { ok: true };
+        const pendingTurns = Object.values(draft.turns).filter(
+          (t) =>
+            t.taskId === task.id &&
+            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+        );
+        const draftLive = pendingTurns.find(
+          (t) => t.status === 'running' || t.status === 'waiting_user',
+        );
+        const cancelled = transitionCancelTask(draftTask, { liveTurn: draftLive, now });
+        if (!cancelled.ok) return cancelled;
+        draft.tasks[task.id] = cancelled.next.task;
+        if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
+        for (const pending of pendingTurns) {
+          if (pending.status !== 'queued' || pending.id === draftLive?.id) continue;
+          const settled = cancelPendingTurn(pending, { now });
+          if (settled.ok) draft.turns[pending.id] = settled.next;
+        }
+        return { ok: true };
+      });
+    }
   }
 
   private reconcileChildWaits(): void {
@@ -579,6 +769,10 @@ export class TaskEngine {
           if (lifecycle) {
             childLifecycles.set(childId, lifecycle);
           }
+        }
+        const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+        if (!turnCap.ok) {
+          return { ok: true };
         }
         const result = resolveChildWait(
           draftTask,
@@ -604,14 +798,74 @@ export class TaskEngine {
     }
   }
 
+  private applyDependencyTerminals(): void {
+    const now = nowIso(this.clock);
+    this.store.commit((draft) => {
+      for (const task of Object.values(draft.tasks)) {
+        if (isTerminalLifecycle(task.lifecycle)) continue;
+        const outcome = dependencyTerminalOutcome(draft, task.id);
+        if (!outcome) continue;
+        const live = Object.values(draft.turns).find(
+          (t) => t.taskId === task.id && (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+        );
+        const terminal = applyDependencyTerminal(task, live, outcome, {
+          now,
+          error: outcome === 'failed' ? 'dependency unsatisfied' : undefined,
+        });
+        if (terminal.ok) {
+          draft.tasks[task.id] = terminal.next.task;
+          if (terminal.next.turn) draft.turns[terminal.next.turn.id] = terminal.next.turn;
+        }
+      }
+      return { ok: true };
+    });
+  }
+
+  private afterTurnSettled(turnId: string): void {
+    this.store.commit((draft) => {
+      pruneLedgerForTurn(draft, turnId);
+      return { ok: true };
+    });
+    this.reconcileChildWaits();
+  }
+
+  private exceedsTurnLimit(taskId: string, candidateTurnId?: string): boolean {
+    const task = this.store.getTask(taskId);
+    if (!task) return true;
+    const turns = this.store.getTurnsForTask(taskId);
+    const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
+    const slotsUsed = turns.filter(
+      (t) => t.status !== 'queued' || t.id === candidateTurnId,
+    ).length;
+    return slotsUsed > cap;
+  }
+
   private scheduleTurn(turnId: string): Promise<void> {
+    this.reconcileTaskTimeouts();
+    this.applyDependencyTerminals();
+    processCancelRequests(this.graphDeps());
+    const turn = this.store.getFile().turns[turnId];
+    if (turn && this.exceedsTurnLimit(turn.taskId, turnId)) {
+      return Promise.resolve();
+    }
+    if (!tryPromoteTurn(this.store, turnId, this.resourceLimits)) {
+      return Promise.resolve();
+    }
     const existing = this.turnPromises.get(turnId);
     if (existing) {
       return existing;
     }
     const promise = this.executeTurn(turnId);
     this.turnPromises.set(turnId, promise);
-    void promise.finally(() => this.turnPromises.delete(turnId));
+    void promise.finally(() => {
+      this.turnPromises.delete(turnId);
+      const queued = Object.values(this.store.getFile().turns).filter((t) => t.status === 'queued');
+      for (const turn of queued) {
+        if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
+          void this.scheduleTurn(turn.id);
+        }
+      }
+    });
     return promise;
   }
 
@@ -639,6 +893,10 @@ export class TaskEngine {
       const draftTask = draft.tasks[turn.taskId];
       if (!draftTurn || draftTurn.status !== 'queued' || !draftTask) {
         return { ok: false, reason: 'turn is no longer schedulable' };
+      }
+      const promote = canPromoteTurn(draft, turnId, this.resourceLimits);
+      if (!promote.ok) {
+        return { ok: false, reason: promote.reason };
       }
       if (isTerminalLifecycle(draftTask.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
@@ -671,6 +929,17 @@ export class TaskEngine {
 
     const abort = new AbortController();
     this.liveRuns.set(turnId, abort);
+    const turnTimeoutMs = task.executionPolicy.turnTimeoutMs;
+    const cancelPoll = setInterval(() => {
+      this.reconcileTaskTimeouts();
+      processCancelRequests(this.graphDeps());
+    }, 250);
+    const turnTimer =
+      turnTimeoutMs > 0
+        ? setTimeout(() => {
+            abort.abort();
+          }, turnTimeoutMs)
+        : undefined;
 
     let rawOutput = '';
     let observedSessionId: string | undefined;
@@ -680,6 +949,7 @@ export class TaskEngine {
       name: task.backend,
       run: async function* () {},
     };
+    let mcpConfigPath: string | undefined;
 
     try {
       try {
@@ -698,13 +968,18 @@ export class TaskEngine {
       const current = this.store.getFile();
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
-      const prompt = projectPrompt(currentTurn, messages);
+      const prompt = projectPrompt(currentTurn, messages, current, this.resourceLimits.maxResultBytes);
+      const built = this.bridgePort > 0 && this.credentialRegistry
+        ? buildRunOptionsForTurn(this.graphDeps(), turnId, {
+            prompt,
+            resumeId: task.committedSessionId,
+            signal: abort.signal,
+          })
+        : { options: { prompt, resumeId: task.committedSessionId, signal: abort.signal } };
+      mcpConfigPath = built.mcpConfigPath;
 
-      for await (const event of this.runTurnFn(backend, {
-        prompt,
-        resumeId: task.committedSessionId,
-        signal: abort.signal,
-      })) {
+      for await (const event of this.runTurnFn(backend, built.options)) {
+        processCancelRequests(this.graphDeps());
         if (terminalSettled) {
           break;
         }
@@ -814,8 +1089,14 @@ export class TaskEngine {
         terminalSettled = await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
       }
     } finally {
+      clearInterval(cancelPoll);
+      if (turnTimer) clearTimeout(turnTimer);
       this.liveRuns.delete(turnId);
       this.acceptedOpIds.delete(turnId);
+      if (this.credentialRegistry) {
+        cleanupTurnResources(this.graphDeps(), turnId, mcpConfigPath);
+      }
+      this.afterTurnSettled(turnId);
       releaseLease(this.storePath, turnId, lease);
     }
   }
@@ -966,6 +1247,10 @@ export class TaskEngine {
 
         for (const effect of result.effects) {
           if (effect.kind === 'enqueueRetry') {
+            const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+            if (!turnCap.ok) {
+              continue;
+            }
             const retryIndex = retryCountOf(turnsForTask(draft, task.id), turnId) + 1;
             const retryId = deterministicRetryTurnId(turnId, retryIndex);
             if (!draft.turns[retryId]) {

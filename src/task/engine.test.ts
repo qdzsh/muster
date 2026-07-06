@@ -410,6 +410,7 @@ describe('TaskEngine', () => {
     TaskEngine.load({
       store: TaskStore.load({ filePath }),
       makeBackend: () => scriptedBackend([]),
+      clock: () => '2026-07-06T00:00:01.000Z',
     });
     const reloaded = TaskStore.load({ filePath });
     expect(reloaded.getFile().turns['turn-1'].status).toBe('running');
@@ -455,6 +456,7 @@ describe('TaskEngine', () => {
     TaskEngine.load({
       store: TaskStore.load({ filePath }),
       makeBackend: () => scriptedBackend([]),
+      clock: () => '2026-07-06T00:00:01.000Z',
     });
     const reloaded = TaskStore.load({ filePath });
     expect(reloaded.getFile().turns['turn-1'].status).toBe('interrupted');
