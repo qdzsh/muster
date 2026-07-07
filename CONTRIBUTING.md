@@ -40,8 +40,7 @@ Vite + Tailwind v4 + vscode-elements). Full spec: [docs/WEBVIEW.md](docs/WEBVIEW
 
 ## What to work on
 
-See [docs/MVP-SCAFFOLD-PLAN.md](docs/MVP-SCAFFOLD-PLAN.md) for phased goals. All five
-ACP backends (Claude, Grok, Kiro, Codex, OpenCode) are implemented. Good tasks now:
+All five ACP backends (Claude, Grok, Kiro, Codex, OpenCode) are implemented. Good tasks now:
 
 - Antigravity (`agy`) ACP backend once it exposes an ACP stdio entry
 - Webview UX (tool cards, reasoning, question UI)

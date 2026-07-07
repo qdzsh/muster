@@ -89,7 +89,7 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/MUSTER-BRIDGE.md](docs/MUSTER-BRIDGE.md) | MCP `ask_user` + AskBridge |
 | [docs/MCP-INJECTION.md](docs/MCP-INJECTION.md) | MCP config per backend |
 | [docs/SESSION-MANAGEMENT.md](docs/SESSION-MANAGEMENT.md) | Session IDs & resume |
-| [docs/MVP-SCAFFOLD-PLAN.md](docs/MVP-SCAFFOLD-PLAN.md) | Implementation phases |
+| [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model & TaskEngine |
 
 Full index: [docs/README.md](docs/README.md).
 
