@@ -16,7 +16,8 @@ export function makeBackend(name: string): Backend {
     case 'codex':
       return new CodexBackend();
     case 'claude':
-    default:
       return new ClaudeBackend();
+    default:
+      throw new Error(`unsupported backend: ${name}`);
   }
 }

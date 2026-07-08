@@ -14,12 +14,19 @@
 
   let answers = $state<Record<string, AskAnswer>>({});
 
+  function defaultAnswer(): AskAnswer {
+    return { selected: [], freeText: null };
+  }
+
+  function readAnswer(index: number): AskAnswer {
+    return answers[String(index)] ?? defaultAnswer();
+  }
+
   function ensureAnswer(index: number): AskAnswer {
     const key = String(index);
-    if (!answers[key]) {
-      answers[key] = { selected: [], freeText: null };
-    }
-    return answers[key];
+    const entry = answers[key] ?? defaultAnswer();
+    answers = { ...answers, [key]: entry };
+    return entry;
   }
 
   function toggleOption(index: number, option: string, multi: boolean): void {
@@ -44,7 +51,7 @@
   function submit(): void {
     const payload: Record<string, AskAnswer> = {};
     for (let i = 0; i < questions.length; i++) {
-      payload[String(i)] = ensureAnswer(i);
+      payload[String(i)] = readAnswer(i);
     }
     post({ type: 'submitAsk', taskId, turnId, askId, answers: payload });
   }
@@ -71,7 +78,7 @@
               <input
                 type={q.options && q.options.length > 1 && !q.allowFreeText ? 'checkbox' : 'radio'}
                 name={`ask-${askId}-${i}`}
-                checked={ensureAnswer(i).selected.includes(option)}
+                checked={readAnswer(i).selected.includes(option)}
                 onchange={() =>
                   toggleOption(i, option, !!(q.options && q.options.length > 1 && !q.allowFreeText))}
               />
@@ -87,7 +94,7 @@
           class="w-full px-1 py-0.5 rounded"
           style="background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border);"
           placeholder="Your answer…"
-          value={ensureAnswer(i).freeText ?? ''}
+          value={readAnswer(i).freeText ?? ''}
           oninput={(e) => setFreeText(i, (e.currentTarget as HTMLInputElement).value)}
         />
       {/if}
