@@ -66,8 +66,7 @@ export type ExtMessage =
   | { type: 'transcriptAppend'; taskId: string; item: TranscriptItem }
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
-  | { type: 'commandError'; taskId?: string; message: string }
-  | { type: 'filePicked'; path: string };
+  | { type: 'commandError'; taskId?: string; message: string };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
@@ -83,8 +82,6 @@ export type OutMessage =
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
   | { type: 'continueTask'; taskId: string; instruction: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
-  | { type: 'pickFile' }
-  | { type: 'resolveFileDrop'; candidates: string[] }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' };
 
@@ -238,9 +235,6 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'commandError':
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
-
-    case 'filePicked':
-      return isString(data.path);
 
     default:
       return false;
