@@ -1,13 +1,26 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
   import { isExtMessage, isProtocolCompatible, post, statusLabel } from './lib/protocol';
-  import type { PendingAsk, PendingPermission, TaskViewStatus } from './lib/protocol';
+  import type {
+    PendingAsk,
+    PendingPermission,
+    RetentionSettingId,
+    RetentionSettingSnapshot,
+    SettingsUpdateResult,
+    TaskViewStatus,
+  } from './lib/protocol';
   import { tip } from './lib/tooltip';
+
+  const SETTING_LABELS: Record<RetentionSettingId, string> = {
+    maxTurnsPerTask: 'Maximum turns per task',
+    maxStoredOutputChars: 'Maximum stored output characters',
+  };
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let pendingPermission = $state<PendingPermission | null>(null);
@@ -25,6 +38,13 @@
   // When no focused task and not in draft, we show the previous tasks list as entry
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
+  let settingsOpen = $state(false);
+  let settingsSnapshot = $state<RetentionSettingSnapshot | null>(null);
+  let settingsLoading = $state(false);
+  let settingsSavingSettingId = $state<RetentionSettingId | null>(null);
+  let settingsSavedMessage = $state<string | null>(null);
+  let settingsGlobalError = $state<string | null>(null);
+  let settingsFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
 
   function selectTask(taskId: string) {
     tasks.focusTask(taskId);
@@ -77,6 +97,20 @@
     post({ type: 'renameTask', taskId, goal });
   }
 
+  function openSettings() {
+    historyOpen = false;
+    settingsOpen = true;
+    settingsLoading = !settingsSnapshot;
+    settingsGlobalError = null;
+    settingsSavedMessage = null;
+    settingsFieldErrors = {};
+    post({ type: 'requestSettings' });
+  }
+
+  function closeSettings() {
+    settingsOpen = false;
+  }
+
   function backToList() {
     tasks.focusedTaskId = null;
     tasks.draftMode = false;
@@ -85,6 +119,52 @@
     // Tell the host we left the chat so it drops its focus; otherwise a later
     // snapshot (e.g. after Clear history) would re-open the stale chat.
     post({ type: 'blurTask' });
+  }
+
+  function settingLabel(settingId: RetentionSettingId): string {
+    return SETTING_LABELS[settingId];
+  }
+
+  function updateSnapshotValue(settingId: RetentionSettingId, value: number) {
+    if (!settingsSnapshot) return;
+    settingsSnapshot = {
+      settings: settingsSnapshot.settings.map((setting) =>
+        setting.id === settingId ? { ...setting, value } : setting,
+      ),
+    };
+  }
+
+  function applySettingsUpdateResult(result: SettingsUpdateResult) {
+    settingsLoading = false;
+    settingsSavingSettingId = null;
+    settingsSavedMessage = null;
+
+    if (result.ok) {
+      updateSnapshotValue(result.settingId, result.value);
+      settingsFieldErrors = { ...settingsFieldErrors, [result.settingId]: undefined };
+      settingsGlobalError = null;
+      settingsSavedMessage = `Saved ${settingLabel(result.settingId)}.`;
+      return;
+    }
+
+    if ('settingId' in result) {
+      if (result.code === 'updateFailed') {
+        settingsGlobalError = `Unable to save ${settingLabel(result.settingId)}. Check the VS Code setting and try again.`;
+      } else {
+        settingsFieldErrors = { ...settingsFieldErrors, [result.settingId]: result.message };
+      }
+      return;
+    }
+
+    settingsGlobalError = 'Unable to load or save settings. Check the VS Code setting and try again.';
+  }
+
+  function saveSetting(settingId: RetentionSettingId, value: number) {
+    settingsSavingSettingId = settingId;
+    settingsSavedMessage = null;
+    settingsGlobalError = null;
+    settingsFieldErrors = { ...settingsFieldErrors, [settingId]: undefined };
+    post({ type: 'updateSetting', settingId, value });
   }
 
   onMount(() => {
@@ -133,6 +213,16 @@
           }
           break;
         }
+
+        case 'settingsSnapshot':
+          settingsSnapshot = msg.snapshot;
+          settingsLoading = false;
+          settingsGlobalError = null;
+          break;
+
+        case 'settingsUpdateResult':
+          applySettingsUpdateResult(msg.result);
+          break;
 
         case 'turnStart':
           threadStore.onTurnStart(msg.taskId, msg.turnId);
@@ -231,6 +321,19 @@
   </div>
 {/if}
 
+{#if settingsOpen}
+  <SettingsPanel
+    onClose={closeSettings}
+    snapshot={settingsSnapshot}
+    loading={settingsLoading}
+    savingSettingId={settingsSavingSettingId}
+    savedMessage={settingsSavedMessage}
+    globalError={settingsGlobalError}
+    fieldErrors={settingsFieldErrors}
+    onSave={saveSetting}
+  />
+{/if}
+
 {#if visibleCommandError}
   <div class="task-command-error" role="alert">
     <div class="min-w-0">
@@ -258,14 +361,27 @@
 {#if !inChat}
   <!-- Entry: New task action, then the searchable previous-tasks list -->
   <div class="flex-1 min-h-0 flex flex-col">
-    <button
-      type="button"
-      class="shrink-0 flex items-center gap-2 px-3 py-2 text-sm font-medium w-full text-left hover:bg-[var(--vscode-list-hoverBackground)]"
-      onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-    >
-      <span class="codicon codicon-add" style="font-size: 16px;"></span>
-      <span>New task</span>
-    </button>
+    <div class="shrink-0 flex items-center">
+      <button
+        type="button"
+        class="flex-1 flex items-center gap-2 px-3 py-2 text-sm font-medium text-left hover:bg-[var(--vscode-list-hoverBackground)]"
+        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+      >
+        <span class="codicon codicon-add" style="font-size: 16px;"></span>
+        <span>New task</span>
+      </button>
+      <button
+        type="button"
+        class="icon-btn shrink-0 mr-2"
+        style="width: 22px; height: 22px;"
+        onclick={openSettings}
+        aria-label="Settings"
+        aria-pressed={settingsOpen}
+        use:tip={'Settings'}
+      >
+        <span class="codicon codicon-settings-gear"></span>
+      </button>
+    </div>
     <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
     <TaskHistoryList
       variant="full"
@@ -281,7 +397,7 @@
       class="shrink-0 border-b"
       style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"
     >
-      <!-- Row 1: Back | History + New task -->
+      <!-- Row 1: Back | History + New task + Settings -->
       <div class="flex items-center gap-2 px-3 py-1 text-xs relative">
         <button
           type="button"
@@ -316,6 +432,18 @@
           use:tip={'New task'}
         >
           <span class="codicon codicon-add"></span>
+        </button>
+
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 22px; height: 22px;"
+          onclick={openSettings}
+          aria-label="Settings"
+          aria-pressed={settingsOpen}
+          use:tip={'Settings'}
+        >
+          <span class="codicon codicon-settings-gear"></span>
         </button>
       </div>
 

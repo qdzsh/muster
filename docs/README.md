@@ -15,5 +15,6 @@ Read in this order when onboarding:
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | MCP `ask_user`, AskBridge, tool catalog |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI — Svelte, Vite, Tailwind, vscode-elements, postMessage protocol |
+| [SETTINGS.md](SETTINGS.md) | Host-backed Settings pattern for feature configuration |
 
 All docs are living — update when CLI versions or spikes change behavior.

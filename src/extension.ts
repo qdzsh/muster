@@ -16,6 +16,11 @@ import {
   type TaskSnapshot,
   type TranscriptItem,
 } from './host/snapshot';
+import {
+  buildRetentionSettingsSnapshot,
+  handleRetentionSettingUpdateAction,
+  type RetentionSettingSnapshot,
+} from './host/retention-settings';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
@@ -91,11 +96,18 @@ function isValidAskAnswers(
   return true;
 }
 
-function getRetentionConfig(): RetentionConfig {
+function readRetentionSettingsSnapshot(): RetentionSettingSnapshot {
   const config = vscode.workspace.getConfiguration('muster.retention');
+  return buildRetentionSettingsSnapshot((key) => config.get(key));
+}
+
+function getRetentionConfig(): RetentionConfig {
+  const snapshot = readRetentionSettingsSnapshot();
   return {
-    maxTurnsPerTask: config.get<number>('maxTurnsPerTask', 200),
-    maxStoredOutputChars: config.get<number>('maxStoredOutputChars', 200_000),
+    maxTurnsPerTask:
+      snapshot.settings.find((setting) => setting.id === 'maxTurnsPerTask')?.value ?? 200,
+    maxStoredOutputChars:
+      snapshot.settings.find((setting) => setting.id === 'maxStoredOutputChars')?.value ?? 200_000,
   };
 }
 
@@ -186,6 +198,31 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'commandError', taskId, message });
   }
 
+  private postSettingsSnapshot(): void {
+    try {
+      this.post({ type: 'settingsSnapshot', snapshot: readRetentionSettingsSnapshot() });
+    } catch {
+      this.post({
+        type: 'settingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'unknownSetting',
+          message: 'Unable to load retention settings.',
+        },
+      });
+    }
+  }
+
+  private async handleUpdateSetting(data: unknown): Promise<void> {
+    const messages = await handleRetentionSettingUpdateAction(
+      vscode.workspace.getConfiguration('muster.retention'),
+      data,
+      vscode.ConfigurationTarget.Workspace,
+    );
+    for (const message of messages) {
+      this.post(message);
+    }
+  }
 
   private workspaceMentionForUri(uri: vscode.Uri): string | undefined {
     const fsPath = uri.fsPath;
@@ -938,12 +975,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
           this.focusedTaskId = undefined;
           break;
+        case 'requestSettings':
+          this.postSettingsSnapshot();
+          break;
+        case 'updateSetting':
+          await this.handleUpdateSetting(data);
+          break;
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
           // host<->webview protocol drift (e.g. a newer webview sending a message
           // type this host build predates) rather than dropping it without a trace.
           console.warn(`Muster: ignoring unknown webview message type ${String(data?.type)}`);
-          break;
       }
     });
 

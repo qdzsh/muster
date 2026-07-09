@@ -27,6 +27,8 @@ interface TaskSummary {
 
 interface SnapshotMessage {
   type: 'snapshot';
+  /** Stamped automatically by postSnapshot() below; omit when constructing test fixtures. */
+  protocolVersion?: number;
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
@@ -64,13 +66,19 @@ async function openWebview(page: Page) {
   });
 
   await page.goto('/');
-  await expect(page.getByText('Muster')).toBeVisible();
+  await expect(page.getByText('New task')).toBeVisible();
 }
+
+// Wire protocol version the webview currently stamps/expects; kept in sync with
+// PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
+// send it so the version-mismatch banner doesn't mask the harness's own
+// snapshot messages.
+const PROTOCOL_VERSION = 2;
 
 async function postSnapshot(page: Page, snapshot: SnapshotMessage) {
   await page.evaluate((message) => {
     window.postMessage(message, '*');
-  }, snapshot);
+  }, { protocolVersion: PROTOCOL_VERSION, ...snapshot });
 }
 
 async function postCommandError(page: Page, message: CommandErrorMessage) {
@@ -142,12 +150,12 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.getByText('No previous tasks.')).toBeVisible();
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
     await expect(page.getByText('New task').first()).toBeVisible();
     await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
     await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Start a browser-visible task.');
-    await page.locator('button[title="Send"]').click();
+    await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Start a browser-visible task.',
@@ -164,17 +172,17 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 2,
     });
 
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
-    await page.locator('button[title="Add file"]').click();
+    await page.getByRole('button', { name: 'Add file' }).click();
     await expectPostedMessage(page, { type: 'pickFile' });
 
     await postRawHostMessage(page, { type: 'filePicked', path: 'src/extension.ts' });
     await expect(page.getByPlaceholder('Start a new coordinator task with claude…')).toHaveValue('@src/extension.ts ');
 
     await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Review @src/extension.ts');
-    await page.locator('button[title="Send"]').click();
+    await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Review @src/extension.ts',
@@ -206,15 +214,15 @@ test.describe('Muster webview host state smoke', () => {
 
     await expect(page.locator('.task-workspace-banner').getByText('Task is running')).toBeVisible();
     await expect(page.locator('.task-workspace-banner').getByText('The assigned agent is actively processing this task')).toBeVisible();
-    await page.locator('button[title="History (previous coordinator tasks)"]').click();
+    await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
     await expect(page.getByRole('button', { name: /Run the model evaluation.*Running.*Agent is working.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Cancelled rollout.*Cancelled.*Stopped before finishing.*Backend claude/i })).toBeVisible();
     await page.getByRole('button', { name: 'Close history' }).click();
     await expect(page.getByText('Task is running')).toBeVisible();
     await expect(page.getByText('Composer is disabled while the active turn is running')).toBeVisible();
-    await expect(page.locator('button[title="Stop"]')).toBeVisible();
-    await page.locator('button[title="Stop"]').click();
+    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
+    await page.getByRole('button', { name: 'Stop' }).click();
     await expectPostedMessage(page, {
       type: 'cancelTurn',
       taskId: 'task-running',
@@ -222,7 +230,7 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     if ((await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i }).count()) === 0) {
-      await page.locator('button[title="History (previous coordinator tasks)"]').click();
+      await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
     }
     await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i }).click();
     await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-recovery' });
@@ -310,7 +318,7 @@ test.describe('Muster webview host state smoke', () => {
     await expectPostedMessage(page, { type: 'newTask' });
     await expect(page.getByText('Continue as new task')).toBeVisible();
     await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Open a follow-up after cancellation.');
-    await page.locator('button[title="Send"]').click();
+    await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Open a follow-up after cancellation.',
@@ -461,6 +469,129 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.getByText('Agent question')).toHaveCount(0);
     await expect(page.locator('.composer-guidance').getByText('Answer the pending prompt to unblock the task.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
+  });
+
+  test('Settings panel edits host-backed retention values without losing task or chat state', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-settings', goal: 'Keep chat state visible', viewStatus: 'idle' })],
+      storeRevision: 10,
+    });
+
+    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByText('Backed by VS Code configuration')).toBeVisible();
+    await expect(page.getByText('Retention keeps recent task history usable without storing unlimited completed-turn output.')).toBeVisible();
+    await expect(page.getByRole('status').getByText('Loading retention settings from VS Code…')).toBeVisible();
+    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
+
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: {
+        settings: [
+          {
+            id: 'maxTurnsPerTask',
+            label: 'Max turns per task',
+            description: 'Controls how many settled turns are retained for each terminal task.',
+            value: 200,
+            defaultValue: 200,
+            minimum: 1,
+          },
+          {
+            id: 'maxStoredOutputChars',
+            label: 'Max stored output characters',
+            description: 'Limits retained assistant output for settled turns on open tasks.',
+            value: 200000,
+            defaultValue: 200000,
+            minimum: 1024,
+          },
+        ],
+      },
+    });
+
+    await expect(page.getByRole('status').getByText('Settings ready. Edit one field at a time; each Save writes only that VS Code setting.')).toBeVisible();
+    await expect(page.getByLabel('Maximum turns per task')).toHaveValue('200');
+    await expect(page.getByLabel('Maximum stored output characters')).toHaveValue('200000');
+    await expect(page.getByText('Minimum 1. Default 200.')).toBeVisible();
+    await expect(page.getByText('Minimum 1024. Default 200000.')).toBeVisible();
+
+    await page.getByLabel('Maximum turns per task').fill('0');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expect(page.getByRole('alert').getByText('Maximum turns per task must be at least 1.')).toBeVisible();
+    await expect.poll(async () => (await postedMessages(page)).filter((message) => (message as { type?: string }).type === 'updateSetting')).toHaveLength(0);
+
+    await page.getByLabel('Maximum turns per task').fill('201');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 201 });
+    await expect(page.getByText('Saving Maximum turns per task…')).toBeVisible();
+
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'maxTurnsPerTask', value: 201 },
+    });
+    await expect(page.getByLabel('Maximum turns per task')).toHaveValue('201');
+    await expect(page.getByText('Saved Maximum turns per task.')).toBeVisible();
+
+    await page.getByLabel('Maximum stored output characters').fill('250000');
+    await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxStoredOutputChars', value: 250000 });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: {
+        ok: false,
+        settingId: 'maxStoredOutputChars',
+        code: 'updateFailed',
+        message: 'Error: leaked stack trace from vscode.workspace.getConfiguration().update',
+      },
+    });
+    await expect(page.getByRole('alert').getByText('Settings save failed')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Unable to save Maximum stored output characters. Check the VS Code setting and try again.')).toBeVisible();
+    await expect(page.getByText('leaked stack trace')).toHaveCount(0);
+    await expect(page.getByLabel('Maximum stored output characters')).toHaveValue('200000');
+
+    await page.setViewportSize({ width: 360, height: 720 });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save Maximum stored output characters' })).toBeVisible();
+    await expect
+      .poll(() =>
+        page.locator('.settings-panel').evaluate((panel) => panel.scrollWidth <= panel.clientWidth),
+      )
+      .toBe(true);
+
+    await page.getByRole('button', { name: 'Close settings' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
+    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
+
+    await page.getByRole('button', { name: /Keep chat state visible.*Idle.*Ready for instructions.*Backend claude/i }).click();
+    await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-settings' });
+    await expectPostedMessage(page, { type: 'hydrateSubtree', taskId: 'task-settings' });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-settings', goal: 'Keep chat state visible', viewStatus: 'idle' })],
+      focusedTaskId: 'task-settings',
+      subtree: [task({ id: 'task-settings', goal: 'Keep chat state visible', viewStatus: 'idle' })],
+      transcript: [{ id: 'msg-settings', kind: 'assistant', content: 'Chat context remains visible.' }],
+      storeRevision: 11,
+    });
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'task-settings',
+      message: 'Host command remains visible.',
+    });
+
+    await expect(page.getByText('Chat context remains visible.')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await page.getByRole('button', { name: 'Close settings' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
+    await expect(page.getByText('Chat context remains visible.')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
   });
 });
 

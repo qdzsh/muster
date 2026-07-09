@@ -90,6 +90,7 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/MCP-INJECTION.md](docs/MCP-INJECTION.md) | MCP config per backend |
 | [docs/SESSION-MANAGEMENT.md](docs/SESSION-MANAGEMENT.md) | Session IDs & resume |
 | [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model & TaskEngine |
+| [docs/SETTINGS.md](docs/SETTINGS.md) | Host-backed Settings pattern |
 
 Full index: [docs/README.md](docs/README.md).
 

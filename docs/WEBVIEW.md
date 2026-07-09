@@ -13,6 +13,7 @@ Authoritative spec for the Muster chat sidebar webview: tech stack, folder layou
 - [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — `ask_user` + AskBridge (§3.2–3.3), extension↔webview messages (§6)
 - [`SESSION-MANAGEMENT.md`](SESSION-MANAGEMENT.md) — resume IDs, `.muster-sessions.json`
 - [`DESIGN.md`](DESIGN.md) — coordinator architecture (extension host vs webview)
+- [`SETTINGS.md`](SETTINGS.md) — host-backed Settings pattern for feature configuration
 
 ---
 
