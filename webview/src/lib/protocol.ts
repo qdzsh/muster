@@ -55,9 +55,49 @@ export interface SnapshotMessage {
   pendingAsk?: PendingAsk;
 }
 
+export type RetentionSettingId = 'maxTurnsPerTask' | 'maxStoredOutputChars';
+
+export interface RetentionSettingValue {
+  id: RetentionSettingId;
+  label: string;
+  description: string;
+  value: number;
+  defaultValue: number;
+  minimum: number;
+}
+
+export interface RetentionSettingSnapshot {
+  settings: RetentionSettingValue[];
+}
+
+export interface SettingsSnapshotMessage {
+  type: 'settingsSnapshot';
+  snapshot: RetentionSettingSnapshot;
+}
+
+export type RetentionSettingErrorCode =
+  | 'unknownSetting'
+  | 'invalidType'
+  | 'nonFinite'
+  | 'nonInteger'
+  | 'belowMinimum'
+  | 'updateFailed';
+
+export type SettingsUpdateResult =
+  | { ok: true; settingId: RetentionSettingId; value: number }
+  | { ok: false; code: 'unknownSetting'; message: string }
+  | { ok: false; settingId: RetentionSettingId; code: Exclude<RetentionSettingErrorCode, 'unknownSetting'>; message: string };
+
+export interface SettingsUpdateResultMessage {
+  type: 'settingsUpdateResult';
+  result: SettingsUpdateResult;
+}
+
 // Extension host -> webview (protocol v2, TASK-MODEL-PHASE-D-PLAN §4.1)
 export type ExtMessage =
   | SnapshotMessage
+  | SettingsSnapshotMessage
+  | SettingsUpdateResultMessage
   | { type: 'taskUpdated'; taskId: string; storeRevision: number; patch: Partial<TaskSummary> }
   | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
   | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
@@ -86,7 +126,9 @@ export type OutMessage =
   | { type: 'pickFile' }
   | { type: 'resolveFileDrop'; candidates: string[] }
   | { type: 'openLink'; url: string }
-  | { type: 'clearHistory' };
+  | { type: 'clearHistory' }
+  | { type: 'requestSettings' }
+  | { type: 'updateSetting'; settingId: RetentionSettingId; value: number };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -103,6 +145,72 @@ function isString(v: unknown): v is string {
 
 function isNumber(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
+}
+
+function hasOnlyKeys(v: Record<string, unknown>, allowedKeys: readonly string[]): boolean {
+  const allowed = new Set(allowedKeys);
+  return Object.keys(v).every((key) => allowed.has(key));
+}
+
+function isInteger(v: unknown): v is number {
+  return isNumber(v) && Number.isInteger(v);
+}
+
+function isRetentionSettingId(v: unknown): v is RetentionSettingId {
+  return v === 'maxTurnsPerTask' || v === 'maxStoredOutputChars';
+}
+
+const RETENTION_SETTING_CONTRACT: Record<RetentionSettingId, { defaultValue: number; minimum: number }> = {
+  maxTurnsPerTask: { defaultValue: 200, minimum: 1 },
+  maxStoredOutputChars: { defaultValue: 200000, minimum: 1024 },
+};
+
+function isRetentionSettingValue(v: unknown): v is RetentionSettingValue {
+  if (!isRecord(v) || !isRetentionSettingId(v.id)) return false;
+  const contract = RETENTION_SETTING_CONTRACT[v.id];
+  return (
+    isString(v.label) &&
+    isString(v.description) &&
+    isInteger(v.value) &&
+    v.value >= contract.minimum &&
+    v.defaultValue === contract.defaultValue &&
+    v.minimum === contract.minimum
+  );
+}
+
+function isRetentionSettingSnapshot(v: unknown): v is RetentionSettingSnapshot {
+  if (!isRecord(v) || !Array.isArray(v.settings)) return false;
+  if (v.settings.length !== Object.keys(RETENTION_SETTING_CONTRACT).length) return false;
+  const seen = new Set<RetentionSettingId>();
+  for (const setting of v.settings) {
+    if (!isRetentionSettingValue(setting) || seen.has(setting.id)) return false;
+    seen.add(setting.id);
+  }
+  return Object.keys(RETENTION_SETTING_CONTRACT).every((id) => seen.has(id as RetentionSettingId));
+}
+
+function isRetentionSettingErrorCode(v: unknown): v is RetentionSettingErrorCode {
+  return (
+    v === 'unknownSetting' ||
+    v === 'invalidType' ||
+    v === 'nonFinite' ||
+    v === 'nonInteger' ||
+    v === 'belowMinimum' ||
+    v === 'updateFailed'
+  );
+}
+
+function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
+  if (!isRecord(v) || typeof v.ok !== 'boolean') return false;
+  if (v.ok) {
+    if (!isRetentionSettingId(v.settingId) || !isInteger(v.value)) return false;
+    return v.value >= RETENTION_SETTING_CONTRACT[v.settingId].minimum;
+  }
+  if (!isRetentionSettingErrorCode(v.code) || !isString(v.message)) return false;
+  if (v.code === 'unknownSetting') {
+    return v.settingId === undefined;
+  }
+  return isRetentionSettingId(v.settingId);
 }
 
 function isTaskSummary(v: unknown): v is TaskSummary {
@@ -211,6 +319,12 @@ export function isExtMessage(data: unknown): data is ExtMessage {
             Array.isArray(data.pendingAsk.questions) &&
             data.pendingAsk.questions.every(isQuestion)))
       );
+
+    case 'settingsSnapshot':
+      return hasOnlyKeys(data, ['type', 'snapshot']) && isRetentionSettingSnapshot(data.snapshot);
+
+    case 'settingsUpdateResult':
+      return hasOnlyKeys(data, ['type', 'result']) && isSettingsUpdateResult(data.result);
 
     case 'taskUpdated':
       return isString(data.taskId) && isNumber(data.storeRevision) && isRecord(data.patch);

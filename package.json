@@ -94,6 +94,8 @@
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
     "test": "vitest run",
     "test:task-audit": "node --test scripts/verify-task-model-ui-state-audit.test.mjs",
+    "test:settings-docs": "node --test scripts/verify-settings-docs.test.mjs",
+    "test:webview": "playwright test e2e/muster-webview-state.spec.ts",
     "test:watch": "vitest",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",

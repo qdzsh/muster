@@ -1,12 +1,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Toolbar from './components/Toolbar.svelte';
+  import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
   import { isExtMessage, post, statusLabel } from './lib/protocol';
-  import type { PendingAsk, TaskViewStatus } from './lib/protocol';
+  import type {
+    PendingAsk,
+    RetentionSettingId,
+    RetentionSettingSnapshot,
+    SettingsUpdateResult,
+    TaskViewStatus,
+  } from './lib/protocol';
+
+  const SETTING_LABELS: Record<RetentionSettingId, string> = {
+    maxTurnsPerTask: 'Maximum turns per task',
+    maxStoredOutputChars: 'Maximum stored output characters',
+  };
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let activeTurnId = $state<string | null>(null);
@@ -19,6 +31,13 @@
   // When no focused task and not in draft, we show the previous tasks list as entry
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
+  let settingsOpen = $state(false);
+  let settingsSnapshot = $state<RetentionSettingSnapshot | null>(null);
+  let settingsLoading = $state(false);
+  let settingsSavingSettingId = $state<RetentionSettingId | null>(null);
+  let settingsSavedMessage = $state<string | null>(null);
+  let settingsGlobalError = $state<string | null>(null);
+  let settingsFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
 
   function selectTask(taskId: string) {
     tasks.focusTask(taskId);
@@ -63,11 +82,71 @@
     post({ type: 'clearHistory' });
   }
 
+  function openSettings() {
+    historyOpen = false;
+    settingsOpen = true;
+    settingsLoading = !settingsSnapshot;
+    settingsGlobalError = null;
+    settingsSavedMessage = null;
+    settingsFieldErrors = {};
+    post({ type: 'requestSettings' });
+  }
+
+  function closeSettings() {
+    settingsOpen = false;
+  }
+
   function backToList() {
     tasks.focusedTaskId = null;
     tasks.draftMode = false;
     threadStore.clearFocus();
     historyOpen = false;
+  }
+
+  function settingLabel(settingId: RetentionSettingId): string {
+    return SETTING_LABELS[settingId];
+  }
+
+  function updateSnapshotValue(settingId: RetentionSettingId, value: number) {
+    if (!settingsSnapshot) return;
+    settingsSnapshot = {
+      settings: settingsSnapshot.settings.map((setting) =>
+        setting.id === settingId ? { ...setting, value } : setting,
+      ),
+    };
+  }
+
+  function applySettingsUpdateResult(result: SettingsUpdateResult) {
+    settingsLoading = false;
+    settingsSavingSettingId = null;
+    settingsSavedMessage = null;
+
+    if (result.ok) {
+      updateSnapshotValue(result.settingId, result.value);
+      settingsFieldErrors = { ...settingsFieldErrors, [result.settingId]: undefined };
+      settingsGlobalError = null;
+      settingsSavedMessage = `Saved ${settingLabel(result.settingId)}.`;
+      return;
+    }
+
+    if ('settingId' in result) {
+      if (result.code === 'updateFailed') {
+        settingsGlobalError = `Unable to save ${settingLabel(result.settingId)}. Check the VS Code setting and try again.`;
+      } else {
+        settingsFieldErrors = { ...settingsFieldErrors, [result.settingId]: result.message };
+      }
+      return;
+    }
+
+    settingsGlobalError = 'Unable to load or save settings. Check the VS Code setting and try again.';
+  }
+
+  function saveSetting(settingId: RetentionSettingId, value: number) {
+    settingsSavingSettingId = settingId;
+    settingsSavedMessage = null;
+    settingsGlobalError = null;
+    settingsFieldErrors = { ...settingsFieldErrors, [settingId]: undefined };
+    post({ type: 'updateSetting', settingId, value });
   }
 
   onMount(() => {
@@ -102,6 +181,16 @@
           }
           break;
         }
+
+        case 'settingsSnapshot':
+          settingsSnapshot = msg.snapshot;
+          settingsLoading = false;
+          settingsGlobalError = null;
+          break;
+
+        case 'settingsUpdateResult':
+          applySettingsUpdateResult(msg.result);
+          break;
 
         case 'turnStart':
           threadStore.onTurnStart(msg.taskId, msg.turnId);
@@ -171,7 +260,20 @@
   });
 </script>
 
-<Toolbar {inChat} {historyOpen} toggleHistory={() => (historyOpen = !historyOpen)} />
+<Toolbar {inChat} {historyOpen} {settingsOpen} toggleHistory={() => (historyOpen = !historyOpen)} onOpenSettings={openSettings} />
+
+{#if settingsOpen}
+  <SettingsPanel
+    onClose={closeSettings}
+    snapshot={settingsSnapshot}
+    loading={settingsLoading}
+    savingSettingId={settingsSavingSettingId}
+    savedMessage={settingsSavedMessage}
+    globalError={settingsGlobalError}
+    fieldErrors={settingsFieldErrors}
+    onSave={saveSetting}
+  />
+{/if}
 
 {#if visibleCommandError}
   <div class="task-command-error" role="alert">

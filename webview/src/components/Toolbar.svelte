@@ -2,10 +2,12 @@
   interface Props {
     inChat?: boolean;
     historyOpen?: boolean;
+    settingsOpen?: boolean;
     toggleHistory?: () => void;
+    onOpenSettings?: () => void;
   }
 
-  let { inChat = false }: Props = $props();
+  let { inChat = false, settingsOpen = false, onOpenSettings = () => {} }: Props = $props();
 </script>
 
 <div
@@ -19,4 +21,16 @@
   {/if}
 
   <span class="flex-1"></span>
+
+  <button
+    type="button"
+    class="icon-btn"
+    style="width: 24px; height: 24px;"
+    onclick={onOpenSettings}
+    aria-label="Settings"
+    aria-pressed={settingsOpen}
+    title="Settings"
+  >
+    <span class="codicon codicon-settings-gear" aria-hidden="true"></span>
+  </button>
 </div>
