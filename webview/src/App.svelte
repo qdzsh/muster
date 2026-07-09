@@ -315,11 +315,11 @@
           ></span>
         </div>
       {:else if tasks.draftMode}
-        <div class="flex items-center gap-2 px-3 py-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold">
+        <div class="flex flex-col px-3 py-1.5" style="border-top: 1px solid var(--vscode-panel-border);">
+          <span class="text-sm font-semibold leading-tight">
             {tasks.continuationOf ? 'Continue as new task' : 'New task'}
           </span>
-          <span class="text-xs" style="opacity: 0.7;">First message creates the coordinator task.</span>
+          <span class="text-xs leading-tight" style="opacity: 0.6; margin-top: 2px;">First message creates the coordinator task.</span>
         </div>
       {/if}
     </div>
