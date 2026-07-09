@@ -440,10 +440,39 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Session / tasks
 
-- **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask`.
-- **Continue as new task** on a terminal thread sends `send { text, continuationOf }` (no `taskId`).
+- **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask` (`lifecycle: open`).
+- **Three status axes** (see `TASK-MANAGEMENT.md` §4.3):
+  - **Task lifecycle** on list + header: `open` / `succeeded` / `failed` /
+    `cancelled` / `skipped`.
+  - **CLI view** on the **composer strip**: `not_started` / `running` / `idle` /
+    `stopped`. Optional subtitle for `lastExit` (`ok` / `error` / `cancelled`)
+    when stopped. **Error is not a CLI phase.**
+  - **Orchestration** (deps, children, recovery, outcome proposal): action panels
+    or a one-line hint — not the task badge.
+  Do **not** set task lifecycle from `turnDone` / CLI errors alone.
+- **CLI mapping:** live generating → `running`; `waiting_user` / process alive
+  not generating → `idle`; never spawned / only queued → `not_started`; process
+  exited → `stopped`.
+- **Who seals outcomes:** **user** always; **coordinator** when the user enables
+  outcome delegation (`coordinator_delegate` / future `yolo`). Show current mode
+  in settings or task chrome. See `TASK-MANAGEMENT.md` §4.1.1.
+- **Outcome proposal** (supervised / `user_confirm`): when a proposal awaits the
+  user, show Accept / Reject (optional reason). Accept complete → `succeeded`.
+  Reject complete with reason → stay `open`. Reject without reason → soft
+  `failed`. Commands: `acceptOutcome` / `rejectOutcome` / `cancelTask` / `skipTask`.
+- **Delegate / yolo:** coordinator may mark success without Accept card; show a
+  short “sealed by coordinator” notice; user can still cancel/override.
+- **Soft failed:** composer stays available; next `send` **reopens** the same task
+  to `open` (not a new task id).
+- **Continue as new task** for **hard** terminal (`succeeded` / `cancelled` /
+  `skipped`): `send { text, continuationOf }` (no `taskId`).
+- **Cancel task** aborts work and cascades `cancelled` to descendants (distinct
+  from interrupt turn).
+- **Skip task** marks a created task as **won’t perform** → `skipped` (user
+  decision; not a CLI status). Distinct from cancel and fail — see
+  `TASK-MANAGEMENT.md` §5.6.
 - Legacy flat chat, `newSession`, and “Continue last” (`.muster-sessions.json`) were removed in Phase E.
-- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls.
+- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls; lifecycle stays `open`.
 - **Reload-preserved queued turn**: **Resume** → `resumeQueuedTurn`.
 
 ### Webview persistence (host-owned transcript + lazy scrollback)
