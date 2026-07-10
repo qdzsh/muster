@@ -1,19 +1,25 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import Toolbar from './components/Toolbar.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
+  import PermissionCard from './components/PermissionCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
-  import { isExtMessage, post, statusLabel } from './lib/protocol';
+  import {
+    effectiveRuntimeActivity,
+    isExtMessage,
+    isProtocolCompatible,
+    post,
+  } from './lib/protocol';
   import type {
     PendingAsk,
+    PendingPermission,
     RetentionSettingId,
     RetentionSettingSnapshot,
     SettingsUpdateResult,
-    TaskViewStatus,
   } from './lib/protocol';
+  import { tip } from './lib/tooltip';
 
   const SETTING_LABELS: Record<RetentionSettingId, string> = {
     maxTurnsPerTask: 'Maximum turns per task',
@@ -21,12 +27,17 @@
   };
 
   let pendingAsk = $state<PendingAsk | null>(null);
+  let pendingPermission = $state<PendingPermission | null>(null);
   let activeTurnId = $state<string | null>(null);
   const visibleCommandError = $derived(
     tasks.commandError && (!tasks.commandError.taskId || tasks.commandError.taskId === tasks.focusedTaskId)
       ? tasks.commandError
       : null,
   );
+  // Set when a bootstrap `snapshot` arrives stamped with a protocolVersion that
+  // differs from ours (host<->webview drift). Surfaces a visible banner instead
+  // of silently dropping the drifted message.
+  let protocolMismatch = $state(false);
 
   // When no focused task and not in draft, we show the previous tasks list as entry
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
@@ -46,40 +57,17 @@
     historyOpen = false;
   }
 
-  function shortGoal(goal: string): string {
-    const trimmed = goal.trim();
-    if (trimmed.length <= 48) return trimmed || '(no goal)';
-    return `${trimmed.slice(0, 45)}…`;
-  }
-
-  function statusIcon(status: TaskViewStatus): string {
-    switch (status) {
-      case 'running':
-      case 'waiting_user':
-        return 'codicon-loading';
-      case 'succeeded':
-        return 'codicon-check';
-      case 'failed':
-        return 'codicon-error';
-      case 'cancelled':
-      case 'skipped':
-        return 'codicon-circle-slash';
-      case 'queued':
-      case 'waiting_dependencies':
-        return 'codicon-clock';
-      case 'blocked':
-      case 'needs_recovery':
-        return 'codicon-warning';
-      case 'waiting_children':
-        return 'codicon-ellipsis';
-      default:
-        return 'codicon-circle-outline';
-    }
-  }
-
   function clearHistory() {
     historyOpen = false;
     post({ type: 'clearHistory' });
+  }
+
+  function deleteTask(taskId: string) {
+    post({ type: 'deleteTask', taskId });
+  }
+
+  function renameTask(taskId: string, goal: string) {
+    post({ type: 'renameTask', taskId, goal });
   }
 
   function openSettings() {
@@ -101,6 +89,9 @@
     tasks.draftMode = false;
     threadStore.clearFocus();
     historyOpen = false;
+    // Tell the host we left the chat so it drops its focus; otherwise a later
+    // snapshot (e.g. after Clear history) would re-open the stale chat.
+    post({ type: 'blurTask' });
   }
 
   function settingLabel(settingId: RetentionSettingId): string {
@@ -152,6 +143,20 @@
   onMount(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
+
+      // Protocol-drift detection: the bootstrap `snapshot` carries the host's
+      // protocolVersion. Check it BEFORE the strict isExtMessage guard, because a
+      // drifted snapshot (shapes changed on the other side) may not pass that
+      // guard and would otherwise be silently dropped. A mismatch — or an absent
+      // version from an old host — raises a visible banner instead of proceeding.
+      if (msg && typeof msg === 'object' && (msg as { type?: unknown }).type === 'snapshot') {
+        if (!isProtocolCompatible((msg as { protocolVersion?: unknown }).protocolVersion)) {
+          protocolMismatch = true;
+          return;
+        }
+        protocolMismatch = false;
+      }
+
       if (!isExtMessage(msg)) return;
 
       switch (msg.type) {
@@ -167,6 +172,10 @@
               msg.transcript,
               msg.activeTurnId,
               focused?.viewStatus,
+              {
+                lifecycle: focused?.lifecycle,
+                runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
+              },
             );
           } else if (tasks.draftMode) {
             threadStore.clearFocus();
@@ -176,8 +185,14 @@
 
         case 'taskUpdated': {
           tasks.applyTaskUpdated(msg.taskId, msg.storeRevision, msg.patch);
-          if (msg.taskId === tasks.focusedTaskId && msg.patch.viewStatus) {
-            threadStore.updateReadOnly(msg.patch.viewStatus);
+          if (msg.taskId === tasks.focusedTaskId) {
+            const focused = tasks.tasks.get(msg.taskId);
+            if (focused) {
+              threadStore.updateReadOnly(focused.lifecycle);
+              threadStore.updateRuntimeFlags(effectiveRuntimeActivity(focused));
+            } else if (msg.patch.lifecycle) {
+              threadStore.updateReadOnly(msg.patch.lifecycle);
+            }
           }
           break;
         }
@@ -247,20 +262,59 @@
           }
           break;
 
+        case 'permissionPending':
+          // Security gate: show regardless of the focused task — a permission
+          // request is session-scoped, and hiding it could silently stall or
+          // (worse) misrepresent what the agent is asking to do.
+          pendingPermission = {
+            sessionId: msg.sessionId,
+            permissionId: msg.permissionId,
+            title: msg.title,
+            kind: msg.kind,
+            classification: msg.classification,
+            options: msg.options,
+          };
+          break;
+
+        case 'permissionCleared':
+          if (pendingPermission && pendingPermission.permissionId === msg.permissionId) {
+            pendingPermission = null;
+          }
+          break;
+
         case 'commandError':
           if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
             tasks.setCommandError(msg.message, msg.taskId ?? null);
           }
           break;
+
+        case 'backendsAvailable':
+          tasks.setAvailableBackends(msg.backends);
+          break;
+
+        case 'modelsAvailable':
+          tasks.setAvailableModels(msg.models);
+          break;
       }
     }
 
     window.addEventListener('message', onMessage);
+    // Ask the host which backends are installed so the picker only offers them.
+    post({ type: 'listBackends' });
+    // Prefetch model lists for the New-task picker (host also prefetches on resolve).
+    post({ type: 'listModels' });
     return () => window.removeEventListener('message', onMessage);
   });
 </script>
 
-<Toolbar {inChat} {historyOpen} {settingsOpen} toggleHistory={() => (historyOpen = !historyOpen)} onOpenSettings={openSettings} />
+{#if protocolMismatch}
+  <div
+    class="px-3 py-1 text-xs"
+    style="color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); border-bottom: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));"
+  >
+    Muster: UI/host version mismatch — reload the window (Developer: Reload Window) to update the panel.
+  </div>
+{/if}
 
 {#if settingsOpen}
   <SettingsPanel
@@ -289,85 +343,101 @@
   </div>
 {/if}
 
+{#if pendingPermission}
+  <PermissionCard
+    permissionId={pendingPermission.permissionId}
+    title={pendingPermission.title}
+    kind={pendingPermission.kind}
+    classification={pendingPermission.classification}
+    options={pendingPermission.options}
+  />
+{/if}
+
 {#if !inChat}
-  <!-- Entry: show previous coordinator tasks -->
-  <div class="flex-1 min-h-0 flex flex-col p-3">
-    <div class="flex items-center justify-between mb-2 px-1">
-      <span class="font-semibold">Previous tasks</span>
+  <!-- Entry: New task action, then the searchable previous-tasks list -->
+  <div class="flex-1 min-h-0 flex flex-col">
+    <div class="shrink-0 flex items-center">
+      <button
+        type="button"
+        class="flex-1 flex items-center gap-2 px-3 py-2 text-sm font-medium text-left hover:bg-[var(--vscode-list-hoverBackground)]"
+        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+      >
+        <span class="codicon codicon-add" style="font-size: 16px;"></span>
+        <span>New task</span>
+      </button>
+      <button
+        type="button"
+        class="icon-btn shrink-0 mr-2"
+        style="width: 22px; height: 22px;"
+        onclick={openSettings}
+        aria-label="Settings"
+        aria-pressed={settingsOpen}
+        use:tip={'Settings'}
+      >
+        <span class="codicon codicon-settings-gear"></span>
+      </button>
+    </div>
+    <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
+    <TaskHistoryList
+      variant="full"
+      onSelect={(id) => { selectTask(id); historyOpen = false; }}
+      onDelete={deleteTask}
+      onRename={renameTask}
+    />
+  </div>
+{:else}
+  <div class="flex-1 min-h-0 flex flex-col relative">
+    <!-- Toolbar only: Back | History + New task + Settings (task title lives in status card) -->
+    <div
+      class="shrink-0 border-b flex items-center gap-2 px-3 py-1 text-xs"
+      style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"
+    >
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={backToList}
+        aria-label="Back to tasks list"
+        use:tip={'Back to tasks list'}
+      >
+        <span class="codicon codicon-arrow-left"></span>
+      </button>
+
+      <div class="flex-1"></div>
+
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={() => (historyOpen = !historyOpen)}
+        aria-label="History (previous coordinator tasks)"
+        use:tip={'History (previous coordinator tasks)'}
+      >
+        <span class="codicon codicon-history"></span>
+      </button>
+
       <button
         type="button"
         class="icon-btn"
         style="width: 22px; height: 22px;"
         onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-        title="New task"
+        aria-label="New task"
+        use:tip={'New task'}
       >
         <span class="codicon codicon-add"></span>
       </button>
-    </div>
-    <TaskHistoryList variant="full" onSelect={(id) => { selectTask(id); historyOpen = false; }} onClear={clearHistory} />
-  </div>
-{:else}
-  <div class="flex-1 min-h-0 flex flex-col relative">
-    <!-- Chat header: two rows -->
-    <div
-      class="shrink-0 border-b"
-      style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"
-    >
-      <!-- Row 1: Back | History + New task -->
-      <div class="flex items-center gap-2 px-3 py-1 text-xs relative">
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={backToList}
-          title="Back to tasks list"
-        >
-          <span class="codicon codicon-arrow-left"></span>
-        </button>
 
-        <div class="flex-1"></div>
-
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={() => (historyOpen = !historyOpen)}
-          title="History (previous coordinator tasks)"
-        >
-          <span class="codicon codicon-history"></span>
-        </button>
-
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-          title="New task"
-        >
-          <span class="codicon codicon-add"></span>
-        </button>
-      </div>
-
-      <!-- Row 2: task name + status (below, left-aligned) -->
-      {#if tasks.focusedTask}
-        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold truncate" title={tasks.focusedTask.goal}>
-            {shortGoal(tasks.focusedTask.goal)}
-          </span>
-          <span 
-            class="codicon {statusIcon(tasks.focusedTask.viewStatus)}" 
-            style="font-size: 14px; vertical-align: middle; margin-left: 4px;"
-            title={statusLabel(tasks.focusedTask.viewStatus)}
-          ></span>
-        </div>
-      {:else if tasks.draftMode}
-        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold">
-            {tasks.continuationOf ? 'Continue as new task' : 'New task'}
-          </span>
-          <span class="text-xs" style="opacity: 0.7;">First message creates the coordinator task.</span>
-        </div>
-      {/if}
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={openSettings}
+        aria-label="Settings"
+        aria-pressed={settingsOpen}
+        use:tip={'Settings'}
+      >
+        <span class="codicon codicon-settings-gear"></span>
+      </button>
     </div>
 
     <TaskWorkspace {pendingAsk} {activeTurnId} />
@@ -390,7 +460,7 @@
           <span class="font-medium">Previous tasks</span>
           <button type="button" class="underline text-xs" onclick={() => { clearHistory(); }}>Clear</button>
         </div>
-        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} onClear={() => { clearHistory(); }} />
+        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} />
       </div>
     {/if}
   </div>

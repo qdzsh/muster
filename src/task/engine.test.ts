@@ -202,7 +202,9 @@ describe('TaskEngine', () => {
     const task = store.getTask('task-1');
     const turn = store.getFile().turns[sent.value.turnId];
     expect(task?.committedSessionId).toBe('sess-123');
-    expect(task?.lifecycle).toBe('succeeded');
+    // Root complete is human-gated: lifecycle stays open with a proposal.
+    expect(task?.lifecycle).toBe('open');
+    expect(task?.outcomeProposal).toMatchObject({ kind: 'complete', result: 'done' });
     expect(turn?.status).toBe('succeeded');
     expect(store.getMessagesForTask('task-1').find((m) => m.role === 'user')?.state).toBe('complete');
   });
@@ -363,8 +365,14 @@ describe('TaskEngine', () => {
     release?.();
     await engine.whenIdle();
 
-    const terminalSend = engine.send('task-1', 'too late');
-    expect(terminalSend).toEqual({ ok: false, reason: 'task is terminal' });
+    // Root stays open after agent complete — user may continue on the same task/session.
+    expect(store.getTask('task-1')?.lifecycle).toBe('open');
+    expect(store.getTask('task-1')?.outcomeProposal?.kind).toBe('complete');
+    const followUp = engine.send('task-1', 'continue please');
+    expect(followUp.ok).toBe(true);
+    // Follow-up clears the proposal and keeps the same open task (session resume on next turn).
+    expect(store.getTask('task-1')?.outcomeProposal).toBeUndefined();
+    expect(store.getTask('task-1')?.lifecycle).toBe('open');
   });
 
   it('leaves reload running turns untouched when a live lease exists', async () => {
@@ -404,7 +412,9 @@ describe('TaskEngine', () => {
     });
     fs.writeFileSync(
       `${filePath}.lease.turn-1`,
-      JSON.stringify({ pid: process.pid, token: 'live' }),
+      // A fresh lease held by this (live) process — createdAt is now, so it is not
+      // reclaimable by the max-age PID-reuse defense.
+      JSON.stringify({ pid: process.pid, token: 'live', createdAt: new Date().toISOString() }),
       'utf8',
     );
 
@@ -576,5 +586,60 @@ describe('TaskEngine transcript persistence (tool + reasoning + segmentation)', 
     const tc = file.toolCalls?.[`${sent.value.turnId}:orphan`];
     expect(tc?.status).toBe('error');
     expect(tc?.error).toBe('boom');
+  });
+});
+
+describe('TaskEngine workspace cwd', () => {
+  it('persists a task cwd and passes it to the turn RunOptions', async () => {
+    const { filePath, store } = makeTempStore();
+    let captured: RunOptions | undefined;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      // Capture the RunOptions the engine dispatches so we can assert cwd flows
+      // through the turn base object all the way to the runner/adapter boundary.
+      runTurn: (backend, options) => {
+        captured = options;
+        return backend.run(options);
+      },
+    });
+
+    const started = engine.startNewTask({
+      goal: 'do a thing',
+      backend: 'fake',
+      cwd: '/workspace/root',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await engine.whenIdle();
+
+    // Persisted on the task...
+    expect(store.getTask(started.value.taskId)?.cwd).toBe('/workspace/root');
+    // ...survives a reload round-trip through the store file...
+    const reloaded = TaskStore.load({ filePath });
+    expect(reloaded.getTask(started.value.taskId)?.cwd).toBe('/workspace/root');
+    // ...and is handed to the turn dispatch as RunOptions.cwd.
+    expect(captured?.cwd).toBe('/workspace/root');
+  });
+
+  it('leaves cwd undefined when no workspace cwd is provided', async () => {
+    const { store } = makeTempStore();
+    let captured: RunOptions | undefined;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      runTurn: (backend, options) => {
+        captured = options;
+        return backend.run(options);
+      },
+    });
+
+    const started = engine.startNewTask({ goal: 'no cwd', backend: 'fake' });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await engine.whenIdle();
+
+    expect(store.getTask(started.value.taskId)?.cwd).toBeUndefined();
+    expect(captured?.cwd).toBeUndefined();
   });
 });

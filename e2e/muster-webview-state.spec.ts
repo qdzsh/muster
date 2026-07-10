@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-type TaskViewStatus =
+type TaskRuntimeActivity =
   | 'waiting_dependencies'
   | 'queued'
   | 'running'
@@ -9,10 +9,15 @@ type TaskViewStatus =
   | 'blocked'
   | 'needs_recovery'
   | 'idle'
+  | 'awaiting_outcome';
+
+type TaskViewStatus =
+  | TaskRuntimeActivity
   | 'succeeded'
   | 'failed'
   | 'cancelled'
-  | 'skipped';
+  | 'skipped'
+  | 'open';
 
 interface TaskSummary {
   id: string;
@@ -20,6 +25,7 @@ interface TaskSummary {
   goal: string;
   role: string;
   lifecycle: string;
+  runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
   updatedAt: string;
   backend: string;
@@ -27,6 +33,8 @@ interface TaskSummary {
 
 interface SnapshotMessage {
   type: 'snapshot';
+  /** Stamped automatically by postSnapshot() below; omit when constructing test fixtures. */
+  protocolVersion?: number;
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
@@ -64,13 +72,19 @@ async function openWebview(page: Page) {
   });
 
   await page.goto('/');
-  await expect(page.getByText('Muster')).toBeVisible();
+  await expect(page.getByText('New task')).toBeVisible();
 }
+
+// Wire protocol version the webview currently stamps/expects; kept in sync with
+// PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
+// send it so the version-mismatch banner doesn't mask the harness's own
+// snapshot messages.
+const PROTOCOL_VERSION = 2;
 
 async function postSnapshot(page: Page, snapshot: SnapshotMessage) {
   await page.evaluate((message) => {
     window.postMessage(message, '*');
-  }, snapshot);
+  }, { protocolVersion: PROTOCOL_VERSION, ...snapshot });
 }
 
 async function postCommandError(page: Page, message: CommandErrorMessage) {
@@ -100,16 +114,34 @@ async function expectButtonDisabledAttribute(page: Page, name: string) {
 }
 
 function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
+  const lifecycle = overrides.lifecycle ?? 'open';
+  const viewStatus = overrides.viewStatus ?? (lifecycle === 'open' ? 'idle' : (lifecycle as TaskViewStatus));
+  const runtimeActivity =
+    overrides.runtimeActivity !== undefined
+      ? overrides.runtimeActivity
+      : lifecycle === 'open'
+        ? ((viewStatus === 'succeeded' ||
+            viewStatus === 'failed' ||
+            viewStatus === 'cancelled' ||
+            viewStatus === 'skipped' ||
+            viewStatus === 'open'
+            ? 'idle'
+            : viewStatus) as TaskRuntimeActivity)
+        : null;
   return {
     id: 'task-root',
     parentId: null,
     goal: 'Wire browser regression harness',
     role: 'coordinator',
-    lifecycle: 'open',
-    viewStatus: 'idle',
+    lifecycle,
+    runtimeActivity,
+    viewStatus,
     updatedAt: '2026-01-01T00:00:00.000Z',
     backend: 'claude',
     ...overrides,
+    lifecycle,
+    runtimeActivity: overrides.runtimeActivity !== undefined ? overrides.runtimeActivity : runtimeActivity,
+    viewStatus: overrides.viewStatus ?? viewStatus,
   };
 }
 
@@ -126,9 +158,14 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 1,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Ready for work')).toBeVisible();
-    await expect(page.locator('.task-workspace-banner').getByText('No turn is currently running for this task.')).toBeVisible();
-    await expect(page.getByText('Wire browser regression harness').first()).toBeVisible();
+    // Collapsed header card: title + status button (details hidden until expand).
+    await expect(page.locator('.task-workspace-banner').getByText('Wire browser regression harness')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toHaveCount(0);
+    await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
+    await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toBeVisible();
+    // Transcript present ⇒ prior process (hadProcess); CLI strip shows stopped, not not_started.
+    await expect(page.locator('[data-cli-status="stopped"]').getByText(/CLI stopped/i)).toBeVisible();
     await expect(page.getByText('Harness ready.')).toBeVisible();
   });
 
@@ -142,12 +179,12 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.getByText('No previous tasks.')).toBeVisible();
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
     await expect(page.getByText('New task').first()).toBeVisible();
     await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
     await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Start a browser-visible task.');
-    await page.locator('button[title="Send"]').click();
+    await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Start a browser-visible task.',
@@ -164,7 +201,7 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 2,
     });
 
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
     const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
@@ -189,7 +226,7 @@ test.describe('Muster webview host state smoke', () => {
     await expect(composer).toHaveValue('Review this @src/extension.ts ');
 
     await composer.fill('Review @src/extension.ts');
-    await page.locator('button[title="Send"]').click();
+    await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Review @src/extension.ts',
@@ -206,7 +243,7 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 2,
     });
 
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
     const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
@@ -235,7 +272,7 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 2,
     });
 
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
     const addContextButton = page.getByRole('button', { name: 'Add Context' });
@@ -267,7 +304,7 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 2,
     });
 
-    await page.locator('button[title="New task"]').first().click();
+    await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
     const composer = page.getByRole('textbox').first();
@@ -330,27 +367,28 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 3,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Task is running')).toBeVisible();
-    await expect(page.locator('.task-workspace-banner').getByText('The assigned agent is actively processing this task')).toBeVisible();
-    await page.locator('button[title="History (previous coordinator tasks)"]').click();
-    await expect(page.getByRole('button', { name: /Run the model evaluation.*Running.*Agent is working.*Backend claude/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /Cancelled rollout.*Cancelled.*Stopped before finishing.*Backend claude/i })).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByText('Run the model evaluation')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('[data-cli-status="running"]').getByText(/CLI running/i)).toBeVisible();
+    await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
+    await expect(page.getByRole('button', { name: /Run the model evaluation.*Task Open.*CLI running.*Backend claude/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /Cancelled rollout.*Task Cancelled.*Backend claude/i })).toBeVisible();
     await page.getByRole('button', { name: 'Close history' }).click();
-    await expect(page.getByText('Task is running')).toBeVisible();
-    await expect(page.getByText('Composer is disabled while the active turn is running')).toBeVisible();
-    await expect(page.locator('button[title="Stop"]')).toBeVisible();
-    await page.locator('button[title="Stop"]').click();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('[data-cli-status="running"]')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
+    await page.getByRole('button', { name: 'Stop' }).click();
     await expectPostedMessage(page, {
       type: 'cancelTurn',
       taskId: 'task-running',
       turnId: 'turn-running',
     });
 
-    if ((await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i }).count()) === 0) {
-      await page.locator('button[title="History (previous coordinator tasks)"]').click();
+    if ((await page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i }).count()) === 0) {
+      await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
     }
-    await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i }).click();
+    await page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i }).click();
     await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-recovery' });
     await expectPostedMessage(page, { type: 'hydrateSubtree', taskId: 'task-recovery' });
 
@@ -363,9 +401,10 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 4,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Recovery needed')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('[data-cli-status="stopped"]').getByText(/CLI stopped/i)).toBeVisible();
     await expect(page.locator('.task-action-panel--danger').getByText('No retryable turn is available for this task.')).toBeVisible();
-    await expect(page.locator('.task-action-panel--danger').getByText('Review the failure, then retry or continue with recovery instructions.')).toBeVisible();
+    await expect(page.locator('.task-action-panel--danger').getByText(/Task lifecycle remains/i)).toBeVisible();
     await expect(page.getByText('Recovery actions need a retryable turn.')).toBeVisible();
     await expectButtonDisabledAttribute(page, 'Retry failed turn');
     await expectButtonDisabledAttribute(page, 'Continue task');
@@ -428,15 +467,15 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 42,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Task cancelled')).toBeVisible();
-    await expect(page.locator('.task-action-panel--muted').getByText('This task is closed; use Continue as new task for follow-up work.')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Cancelled/i })).toBeVisible();
+    await expect(page.locator('.task-action-panel--muted').getByText(/This task is closed; use Continue as new task/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Continue as new task' })).toBeVisible();
-    await expect(page.locator('.composer-guidance').getByText('This task is closed; use Continue as new task for follow-up work.')).toBeVisible();
+    await expect(page.locator('.composer-guidance').getByText(/This task is closed; use Continue as new task/i)).toBeVisible();
     await page.getByRole('button', { name: 'Continue as new task' }).click();
     await expectPostedMessage(page, { type: 'newTask' });
     await expect(page.getByText('Continue as new task')).toBeVisible();
     await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Open a follow-up after cancellation.');
-    await page.locator('button[title="Send"]').click();
+    await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Open a follow-up after cancellation.',
@@ -454,7 +493,9 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 46,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Queued for execution')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
+    await expect(page.locator('.task-workspace-orchestration').getByText(/Queued/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Resume queued task' })).toBeVisible();
     await expect(page.getByText('Queued turn is waiting to resume.')).toBeVisible();
     await page.getByRole('button', { name: 'Resume queued task' }).click();
@@ -466,16 +507,18 @@ test.describe('Muster webview host state smoke', () => {
 
     await postSnapshot(page, {
       type: 'snapshot',
-      rootTasks: [task({ id: 'task-failed', goal: 'Failed rollout', viewStatus: 'failed', lifecycle: 'failed' })],
+      rootTasks: [task({ id: 'task-failed', goal: 'Failed rollout', viewStatus: 'failed', lifecycle: 'failed', runtimeActivity: null })],
       focusedTaskId: 'task-failed',
-      subtree: [task({ id: 'task-failed', goal: 'Failed rollout', viewStatus: 'failed', lifecycle: 'failed' })],
+      subtree: [task({ id: 'task-failed', goal: 'Failed rollout', viewStatus: 'failed', lifecycle: 'failed', runtimeActivity: null })],
       transcript: [{ id: 'msg-3', kind: 'error', content: 'Build failed.' }],
       storeRevision: 47,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Task failed')).toBeVisible();
-    await expect(page.locator('.task-action-panel--muted').getByText('This task is closed; use Continue as new task for follow-up work.')).toBeVisible();
-    await expect(page.locator('.composer-guidance').getByText('This task is closed; use Continue as new task for follow-up work.')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Failed/i })).toBeVisible();
+    // Soft failed: reopen via send on the same task — not hard-terminal "Continue as new".
+    await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
+    await expect(page.getByText(/Send a message to reopen/i).first()).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Continue as new task' })).toHaveCount(0);
 
     await postSnapshot(page, {
       type: 'snapshot',
@@ -486,8 +529,8 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 48,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Task succeeded')).toBeVisible();
-    await expect(page.locator('.task-action-panel--muted').getByText('This task is closed; use Continue as new task for follow-up work.')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Succeeded/i })).toBeVisible();
+    await expect(page.locator('.task-action-panel--muted').getByText(/This task is closed; use Continue as new task/i)).toBeVisible();
 
     await postCommandError(page, {
       type: 'commandError',
@@ -549,12 +592,15 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 1,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Input required')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    // ask_user: process on, not generating → CLI idle
+    await expect(page.locator('[data-cli-status="idle"]').getByText(/CLI idle/i)).toBeVisible();
     await expect(page.getByText('Agent question')).toBeVisible();
     await expect(page.getByText('Which model should continue?')).toBeVisible();
     await expect(page.locator('.composer-guidance').getByText('Answer the pending task question above to continue.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
+    // Process is still up (CLI idle) — Stop remains available to abort the turn.
+    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
     await page.locator('vscode-radio').filter({ hasText: 'Claude' }).click();
     await page.getByRole('button', { name: 'Submit' }).click();
     await expectPostedMessage(page, {
@@ -585,8 +631,9 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.getByText('Agent question')).toHaveCount(0);
-    await expect(page.locator('.composer-guidance').getByText('Answer the pending prompt to unblock the task.')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
+    // ask_user without pending card: process still on → CLI idle (not running).
+    await expect(page.locator('[data-cli-status="idle"]').getByText(/CLI idle/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
   });
 
   test('Settings panel edits host-backed retention values without losing task or chat state', async ({ page }) => {
@@ -598,14 +645,14 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 10,
     });
 
-    await expect(page.getByText('Previous tasks', { exact: true })).toBeVisible();
+    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
     await page.getByRole('button', { name: 'Settings' }).click();
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
     await expect(page.getByText('Backed by VS Code configuration')).toBeVisible();
     await expect(page.getByText('Retention keeps recent task history usable without storing unlimited completed-turn output.')).toBeVisible();
     await expect(page.getByRole('status').getByText('Loading retention settings from VS Code…')).toBeVisible();
-    await expect(page.getByText('Previous tasks', { exact: true })).toBeVisible();
+    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
 
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
@@ -682,9 +729,9 @@ test.describe('Muster webview host state smoke', () => {
 
     await page.getByRole('button', { name: 'Close settings' }).click();
     await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
-    await expect(page.getByText('Previous tasks', { exact: true })).toBeVisible();
+    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
 
-    await page.getByRole('button', { name: /Keep chat state visible.*Idle.*Ready for instructions.*Backend claude/i }).click();
+    await page.getByRole('button', { name: /Keep chat state visible.*Task Open.*Backend claude/i }).click();
     await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-settings' });
     await expectPostedMessage(page, { type: 'hydrateSubtree', taskId: 'task-settings' });
     await postSnapshot(page, {

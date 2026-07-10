@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
 import { AskBridge } from './bridge/ask-bridge';
 import type { Question } from './bridge/ask-bridge';
+import { PermissionBridge } from './bridge/permission-bridge';
+import type { PermissionRequest } from './bridge/permission-bridge';
 import { CredentialRegistry } from './bridge/credentials';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
-import { disposeSharedAcpClient } from './backends/acp-client';
+import { disposeSharedAcpClient, setPermissionController } from './backends/acp-client';
+import type { PermissionController } from './backends/acp-client';
+import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
   buildSnapshot,
   projectTaskSummary,
@@ -17,6 +21,7 @@ import {
   handleRetentionSettingUpdateAction,
   type RetentionSettingSnapshot,
 } from './host/retention-settings';
+import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { PresentationManager } from './host/presentation-manager';
 import {
@@ -26,16 +31,20 @@ import {
 } from './host/presentation-panel-adapter';
 import { PresentationToolRouter } from './host/presentation-tool-router';
 import { createPresentationChatLink } from './host/presentation-chat-link';
+import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
-import { TaskEngine, type EngineEvent } from './task/engine';
-import { TaskStore, computeAffectedTaskIds } from './task/store';
+import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
+import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
 import { isTerminalLifecycle } from './task/transitions';
+import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
 import * as fs from 'fs';
 import * as path from 'path';
 
 let askBridge: AskBridge | undefined;
+let permissionBridge: PermissionBridge | undefined;
+let permissionAuditChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
@@ -46,6 +55,27 @@ let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
+
+/**
+ * Host copy of the webview wire protocol version. The source of truth is
+ * PROTOCOL_VERSION in webview/src/lib/protocol.ts; the host cannot import that
+ * module because its graph has browser-only side effects (acquireVsCodeApi runs
+ * at import time), so the value is duplicated here. Keep the two in sync: the
+ * version is stamped on the bootstrap `snapshot` message, and a mismatch is
+ * surfaced in the webview as a visible "reload the window" banner.
+ */
+const PROTOCOL_VERSION = 2;
+
+/** How long a permission prompt waits for a webview decision before safe-denying. */
+const PERMISSION_PROMPT_TIMEOUT_MS = 120_000;
+/** Reject oversized inbound webview identifiers/option ids (defense-in-depth). */
+const MAX_ID_CHARS = 256;
+
+/** Read the live permission mode from settings (never frozen at connect time). */
+function getPermissionMode(): PermissionMode {
+  const mode = vscode.workspace.getConfiguration('muster.permissions').get<string>('mode', 'ask');
+  return mode === 'allow' || mode === 'readonly' ? mode : 'ask';
+}
 
 /** Backends the webview may request. Mirrors the composer's select options. */
 const WEBVIEW_BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']);
@@ -178,6 +208,10 @@ function taskRecordsChanged(
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
   private _view?: vscode.WebviewView;
+  /** In-flight/cached detection of which backend CLIs are callable (computed once). */
+  private availableBackendsPromise?: Promise<string[]>;
+  /** In-flight/cached per-backend model enumeration (computed once). */
+  private availableModelsPromise?: Promise<Record<string, BackendModels>>;
   focusedTaskId?: string;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -343,6 +377,73 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.postCommandError('Drop a file from the current workspace to mention it in chat.');
   }
 
+  /**
+   * Detect (once, cached) which backend CLIs are installed on this machine and
+   * tell the webview so its picker only offers callable backends. If detection
+   * fails we stay silent — the webview then fails open and shows all backends.
+   */
+  private async postAvailableBackends(): Promise<void> {
+    try {
+      // Cache the in-flight promise so a concurrent panel-open + `listBackends`
+      // don't run detection twice.
+      this.availableBackendsPromise ??= detectAvailableBackends();
+      const backends = await this.availableBackendsPromise;
+      this.post({ type: 'backendsAvailable', backends });
+    } catch {
+      // Detection failed — drop the cached rejection so a later request retries;
+      // the webview meanwhile fails open and shows all backends.
+      this.availableBackendsPromise = undefined;
+    }
+  }
+
+  /**
+   * Enumerate each installed backend's models (via a throwaway ACP session) and
+   * send them to the webview for the grouped model picker.
+   *
+   * Posts progressive updates as each backend settles (so the picker fills in
+   * without waiting for the slowest CLI). An empty final result is not cached
+   * forever — the next request retries. Failures stay fail-open (plain backend
+   * labels) with a console warning.
+   */
+  private async postAvailableModels(): Promise<void> {
+    if (this.availableModelsPromise) {
+      // Already enumerating / done — re-post whatever we have when it finishes.
+      try {
+        const models = await this.availableModelsPromise;
+        if (Object.keys(models).length > 0) {
+          this.post({ type: 'modelsAvailable', models });
+        }
+      } catch {
+        this.availableModelsPromise = undefined;
+      }
+      return;
+    }
+
+    this.availableModelsPromise = (async () => {
+      const backends = await (this.availableBackendsPromise ??= detectAvailableBackends());
+      console.info(`Muster: enumerating models for backends: ${backends.join(', ') || '(none)'}`);
+      const models = await enumerateModels(backends, resolveTaskCwd(), (partial) => {
+        this.post({ type: 'modelsAvailable', models: partial });
+      });
+      console.info(
+        `Muster: model catalog ready for ${Object.keys(models).join(', ') || '(no model options)'}`,
+      );
+      return models;
+    })();
+
+    try {
+      const models = await this.availableModelsPromise;
+      this.post({ type: 'modelsAvailable', models });
+      // Empty catalog: drop cache so a later listModels can retry (transient ACP failures).
+      if (Object.keys(models).length === 0) {
+        this.availableModelsPromise = undefined;
+      }
+    } catch (err) {
+      console.warn('Muster: model enumeration failed:', err instanceof Error ? err.message : err);
+      this.availableModelsPromise = undefined;
+    }
+  }
+
   forwardTurnEvent(event: EngineEvent): void {
     switch (event.type) {
       case 'turnStart':
@@ -462,7 +563,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     const focus = focusedTaskId ?? this.focusedTaskId;
     const snapshot: TaskSnapshot = buildSnapshot(taskStore, focus, activePendingAsks);
-    this.post({ type: 'snapshot', ...snapshot });
+    // Stamp the wire version on the bootstrap message so the webview can detect
+    // host<->webview drift once (and show a reload banner) instead of silently
+    // dropping mismatched messages.
+    this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
     if (focus) {
       this.focusedTaskId = focus;
     }
@@ -489,76 +593,175 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     void vscode.env.openExternal(parsed);
   }
 
+  /**
+   * A task is removable only if it is idle or terminal (not actively working)
+   * and it is not the currently focused task. Removability is derived from the
+   * fresh `draft` (via viewStatusFromDraft) so the check is consistent with the
+   * exact bytes a commit is about to write — see the guard-inside-commit note on
+   * handleDeleteTask/handleClearHistory.
+   */
+  private isDraftTaskRemovable(draft: TaskStoreFile, id: string, focus: string | undefined): boolean {
+    if (id === focus) return false;
+    const viewStatus = viewStatusFromDraft(draft, id);
+    return (
+      viewStatus === 'idle' ||
+      viewStatus === 'succeeded' ||
+      viewStatus === 'failed' ||
+      viewStatus === 'cancelled' ||
+      viewStatus === 'skipped'
+    );
+  }
+
+  /** Index children by parent id so whole subtrees can be inspected. */
+  private buildChildrenIndex(tasks: TaskStoreFile['tasks']): Map<string, string[]> {
+    const childrenOf = new Map<string, string[]>();
+    for (const t of Object.values(tasks)) {
+      if (t.parentId) {
+        const list = childrenOf.get(t.parentId);
+        if (list) list.push(t.id);
+        else childrenOf.set(t.parentId, [t.id]);
+      }
+    }
+    return childrenOf;
+  }
+
+  /**
+   * Return every task id in the subtree rooted at `rootId` IF every task in it
+   * is removable; otherwise null. A root can be idle/terminal while a delegated
+   * child is still queued/running, and deleting the subtree would otherwise nuke
+   * that in-flight work — so the whole subtree must be clear before removal.
+   */
+  private removableSubtree(
+    draft: TaskStoreFile,
+    rootId: string,
+    childrenOf: Map<string, string[]>,
+    focus: string | undefined,
+  ): string[] | null {
+    const subtree: string[] = [];
+    const stack: string[] = [rootId];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      subtree.push(id);
+      if (!this.isDraftTaskRemovable(draft, id, focus)) return null;
+      for (const child of childrenOf.get(id) ?? []) stack.push(child);
+    }
+    return subtree;
+  }
+
+  /**
+   * Mutate `draft` in place: delete the given task ids and their
+   * turns/messages/toolCalls/reasoning. Called from inside a `commit` callback
+   * (operations/cancelRequests are turn-keyed or ledger; safe to leave).
+   */
+  private applyTaskDeletion(draft: TaskStoreFile, ids: Iterable<string>): void {
+    const idSet = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
+    for (const id of idSet) {
+      delete draft.tasks[id];
+      for (const turnId of Object.keys(draft.turns)) {
+        if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
+      }
+      for (const msgId of Object.keys(draft.messages)) {
+        if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
+      }
+      if (draft.toolCalls) {
+        for (const key of Object.keys(draft.toolCalls)) {
+          if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
+        }
+      }
+      if (draft.reasoning) {
+        for (const key of Object.keys(draft.reasoning)) {
+          if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
+        }
+      }
+    }
+    // ensure optionals exist
+    draft.operations = draft.operations ?? {};
+    draft.cancelRequests = draft.cancelRequests ?? {};
+  }
+
+  /** Surface a failed commit as a command error. Returns true when it failed. */
+  private reportCommitFailure(result: CommitResult): boolean {
+    if (result.ok) return false;
+    this.postCommandError(result.detail ?? `store ${result.reason}`);
+    return true;
+  }
+
   private handleClearHistory(): void {
     if (!taskStore) {
       this.postCommandError('task store not ready');
       return;
     }
-    const file = taskStore.getFile();
     const focus = this.focusedTaskId;
-
-    // Collect terminal root tasks to remove (except the currently focused one)
-    // Only coordinators (parentId null). Preserve running / non-terminal.
-    const toRemoveRoots: string[] = [];
-    for (const task of Object.values(file.tasks)) {
-      if (task.parentId !== null) continue;
-      if (task.id === focus) continue;
-      const isTerminal = task.lifecycle === 'succeeded' || task.lifecycle === 'failed' || task.lifecycle === 'cancelled' || task.lifecycle === 'skipped';
-      if (isTerminal) {
-        toRemoveRoots.push(task.id);
+    let focusRemoved = false;
+    // Compute removable subtrees INSIDE the commit against the fresh `draft` that
+    // commit re-reads under the store lock. Deciding on the pre-commit snapshot
+    // would be TOCTOU-unsafe: another window could add a delegated descendant or
+    // flip a task to running between the check and the write, orphaning the child
+    // or deleting active work.
+    const result = taskStore.commit((draft) => {
+      const childrenOf = this.buildChildrenIndex(draft.tasks);
+      const toRemove = new Set<string>();
+      for (const task of Object.values(draft.tasks)) {
+        if (task.parentId !== null) continue;
+        const subtree = this.removableSubtree(draft, task.id, childrenOf, focus);
+        if (subtree) for (const id of subtree) toRemove.add(id);
       }
-    }
-
-    if (toRemoveRoots.length === 0) {
-      // nothing to clear, refresh anyway
-      this.postSnapshot(focus);
-      return;
-    }
-
-    // Collect full subtrees for removal
-    const toRemove = new Set<string>();
-    const queue = [...toRemoveRoots];
-    while (queue.length > 0) {
-      const id = queue.shift()!;
-      if (toRemove.has(id)) continue;
-      toRemove.add(id);
-      for (const t of Object.values(file.tasks)) {
-        if (t.parentId === id) queue.push(t.id);
-      }
-    }
-
-    taskStore.commit((draft) => {
-      for (const id of toRemove) {
-        delete draft.tasks[id];
-        // remove related turns and messages (operations/cancelRequests are turn-keyed or ledger; safe to leave)
-        for (const turnId of Object.keys(draft.turns)) {
-          if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
-        }
-        for (const msgId of Object.keys(draft.messages)) {
-          if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
-        }
-        if (draft.toolCalls) {
-          for (const key of Object.keys(draft.toolCalls)) {
-            if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
-          }
-        }
-        if (draft.reasoning) {
-          for (const key of Object.keys(draft.reasoning)) {
-            if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
-          }
-        }
-      }
-      // ensure optionals exist
-      draft.operations = draft.operations ?? {};
-      draft.cancelRequests = draft.cancelRequests ?? {};
+      if (toRemove.size === 0) return { ok: true }; // nothing removable — no-op
+      this.applyTaskDeletion(draft, toRemove);
+      if (focus && toRemove.has(focus)) focusRemoved = true;
       return { ok: true };
     });
+    if (this.reportCommitFailure(result)) return;
+    if (focusRemoved) this.focusedTaskId = undefined;
+    this.postSnapshot(this.focusedTaskId);
+  }
 
-    // If focused was removed (shouldn't), clear it
-    if (focus && toRemove.has(focus)) {
-      this.focusedTaskId = undefined;
+  /** Delete a single top-level task (and its whole subtree) from history. */
+  private handleDeleteTask(taskId: string): void {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
     }
+    const focus = this.focusedTaskId;
+    let focusRemoved = false;
+    // Validate + delete atomically against the fresh `draft` (see handleClearHistory).
+    const result = taskStore.commit((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task) return { ok: true }; // already gone — no-op
+      if (task.parentId !== null) return { ok: false, reason: 'Only top-level tasks can be deleted.' };
+      const childrenOf = this.buildChildrenIndex(draft.tasks);
+      const subtree = this.removableSubtree(draft, taskId, childrenOf, focus);
+      if (!subtree) {
+        return { ok: false, reason: 'Cannot delete a task while it or a subtask is still running.' };
+      }
+      this.applyTaskDeletion(draft, subtree);
+      if (focus && subtree.includes(focus)) focusRemoved = true;
+      return { ok: true };
+    });
+    if (this.reportCommitFailure(result)) return;
+    if (focusRemoved) this.focusedTaskId = undefined;
+    this.postSnapshot(this.focusedTaskId);
+  }
 
+  /** Rename a task by replacing its goal (the display label). */
+  private handleRenameTask(taskId: string, goal: string): void {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
+    }
+    const trimmed = goal.trim();
+    if (!trimmed) {
+      this.postCommandError('Task name cannot be empty.');
+      return;
+    }
+    const capped = trimmed.length > MAX_MESSAGE_CHARS ? trimmed.slice(0, MAX_MESSAGE_CHARS) : trimmed;
+    const result = taskStore.commit((draft) => {
+      const t = draft.tasks[taskId];
+      if (!t) return { ok: true }; // gone — no-op
+      t.goal = capped;
+      return { ok: true };
+    });
+    if (this.reportCommitFailure(result)) return;
     this.postSnapshot(this.focusedTaskId);
   }
 
@@ -595,6 +798,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     taskId?: string;
     text: string;
     backend?: string;
+    model?: string;
     continuationOf?: string;
   }): Promise<void> {
     if (!taskEngine || !taskStore) {
@@ -635,7 +839,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         goal: shortGoal,
         message: fullMessage,
         backend: data.backend ?? 'claude',
+        model: typeof data.model === 'string' && data.model ? data.model : undefined,
         continuationOf: data.continuationOf,
+        // Capture the workspace cwd at task-creation time so every turn (and any
+        // delegated child) runs in the right directory instead of process.cwd().
+        cwd: resolveTaskCwd(),
       });
       if (!result.ok) {
         this.postCommandError(result.reason);
@@ -804,6 +1012,42 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             }
           }
           break;
+        case 'setTaskLifecycle': {
+          if (!taskEngine) {
+            this.postCommandError('task engine not ready');
+            break;
+          }
+          if (typeof data.taskId !== 'string') {
+            this.postCommandError('setTaskLifecycle requires taskId');
+            break;
+          }
+          const lifecycle = data.lifecycle;
+          if (
+            lifecycle !== 'open' &&
+            lifecycle !== 'succeeded' &&
+            lifecycle !== 'failed' &&
+            lifecycle !== 'cancelled' &&
+            lifecycle !== 'skipped'
+          ) {
+            this.postCommandError('setTaskLifecycle requires a valid lifecycle', data.taskId);
+            break;
+          }
+          // Cancel/skip cascade to descendants; other seals are single-task (user menu).
+          // setTaskLifecycle routes 'skipped' → skipTask and 'cancelled' is handled here.
+          const result =
+            lifecycle === 'cancelled'
+              ? taskEngine.cancelTask(data.taskId)
+              : taskEngine.setTaskLifecycle(data.taskId, lifecycle, {
+                  result: typeof data.result === 'string' ? data.result : undefined,
+                  error: typeof data.error === 'string' ? data.error : undefined,
+                });
+          if (!result.ok) {
+            this.postCommandError(result.reason, data.taskId);
+          } else {
+            this.postSnapshot(this.focusedTaskId ?? data.taskId);
+          }
+          break;
+        }
         case 'submitAsk':
           if (
             typeof data.taskId === 'string' &&
@@ -837,6 +1081,43 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             });
           }
           break;
+        case 'submitPermission': {
+          if (
+            typeof data.permissionId !== 'string' ||
+            typeof data.optionId !== 'string' ||
+            typeof data.remember !== 'boolean' ||
+            data.permissionId.length === 0 ||
+            data.permissionId.length > MAX_ID_CHARS ||
+            data.optionId.length === 0 ||
+            data.optionId.length > MAX_ID_CHARS
+          ) {
+            this.postCommandError('invalid permission submission');
+            break;
+          }
+          // The id must be a currently-pending prompt, and the optionId must be
+          // one the agent actually offered for it — never trust an arbitrary id.
+          const pending = permissionBridge?.peek(data.permissionId);
+          if (!pending) {
+            this.postCommandError('no such pending permission');
+            break;
+          }
+          if (!pending.options.some((o) => o.optionId === data.optionId)) {
+            this.postCommandError('permission option not offered');
+            break;
+          }
+          permissionBridge?.submit(data.permissionId, {
+            optionId: data.optionId,
+            remember: data.remember,
+          });
+          break;
+        }
+        case 'cancelPermission': {
+          if (typeof data.permissionId !== 'string' || data.permissionId.length > MAX_ID_CHARS) {
+            break;
+          }
+          permissionBridge?.cancel(data.permissionId);
+          break;
+        }
         case 'pickFile':
           await this.handlePickFile();
           break;
@@ -852,18 +1133,49 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'clearHistory':
           this.handleClearHistory();
           break;
+        case 'deleteTask':
+          if (typeof data.taskId === 'string') {
+            this.handleDeleteTask(data.taskId);
+          }
+          break;
+        case 'renameTask':
+          if (typeof data.taskId === 'string' && typeof data.goal === 'string') {
+            this.handleRenameTask(data.taskId, data.goal);
+          }
+          break;
+        case 'blurTask':
+          // Webview returned to the task list; drop the host-side focus so a
+          // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
+          this.focusedTaskId = undefined;
+          break;
         case 'requestSettings':
           this.postSettingsSnapshot();
           break;
         case 'updateSetting':
           await this.handleUpdateSetting(data);
           break;
+        case 'listBackends':
+          void this.postAvailableBackends();
+          break;
+        case 'listModels':
+          void this.postAvailableModels();
+          break;
+        default:
+          // Unknown inbound type: log instead of silently ignoring. This surfaces
+          // host<->webview protocol drift (e.g. a newer webview sending a message
+          // type this host build predates) rather than dropping it without a trace.
+          console.warn(`Muster: ignoring unknown webview message type ${String(data?.type)}`);
       }
     });
 
     // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
     // User selects from list or New task to enter chat.
     this.postSnapshot(this.focusedTaskId);
+    // Tell the webview which backends are actually installed so its picker only
+    // offers callable ones (the webview also requests this on mount).
+    void this.postAvailableBackends();
+    // Prefetch model catalog so New task can show [Backend] Model options promptly.
+    void this.postAvailableModels();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -889,7 +1201,23 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 }
 
+/**
+ * Resolve the workspace directory a new task's agent should run in. Multi-root
+ * aware via {@link resolveWorkspaceCwd}: the folder holding the active editor
+ * file wins, else the first workspace folder. Falls back to process.cwd() when
+ * no folder is open (matching every ACP adapter's own fallback).
+ */
+function resolveTaskCwd(): string {
+  const folders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+  const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath;
+  return resolveWorkspaceCwd(folders, activeFile) ?? process.cwd();
+}
+
 export async function activate(context: vscode.ExtensionContext) {
+  // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
+  // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
+  await installAugmentedPath();
+
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
   storePath = wsFolder
@@ -960,6 +1288,62 @@ export async function activate(context: vscode.ExtensionContext) {
         });
       },
     });
+
+    // Permission approval gate: prompts route to a webview card; the audit log
+    // records every allow/deny decision.
+    permissionAuditChannel = vscode.window.createOutputChannel('Muster Permissions');
+    context.subscriptions.push(permissionAuditChannel);
+    permissionBridge = new PermissionBridge({
+      onRegister: (permissionId, request: PermissionRequest) => {
+        provider['_view']?.webview.postMessage({
+          type: 'permissionPending',
+          sessionId: request.sessionId,
+          permissionId,
+          title: request.title,
+          kind: request.kind,
+          classification: request.classification,
+          options: request.options.map((o) => ({
+            optionId: o.optionId,
+            name: o.name ?? o.optionId,
+            kind: o.kind,
+          })),
+        });
+      },
+      onResolve: (permissionId) => {
+        provider['_view']?.webview.postMessage({ type: 'permissionCleared', permissionId });
+      },
+    });
+    const bridge = permissionBridge;
+    const auditChannel = permissionAuditChannel;
+    const permissionController: PermissionController = {
+      // Read live each call — AcpClient is a shared singleton constructed once,
+      // so the mode must NOT be frozen at first connect.
+      mode: () => getPermissionMode(),
+      isAllowlisted: (sessionId, key) => bridge.isAllowlisted(sessionId, key),
+      remember: (sessionId, key) => bridge.remember(sessionId, key),
+      audit: (entry: PermissionAuditEntry) => {
+        bridge.recordAudit(entry);
+        auditChannel.appendLine(
+          `${entry.at} ${entry.decision.toUpperCase()} [${entry.source}] ` +
+            `session=${entry.sessionId} class=${entry.classification} ` +
+            `kind=${entry.kind} title=${JSON.stringify(entry.title)}`,
+        );
+      },
+      prompt: (req) =>
+        bridge.register(
+          bridge.generatePermissionId(),
+          {
+            sessionId: req.sessionId,
+            title: req.title,
+            kind: req.kind,
+            classification: req.classification,
+            options: req.options,
+          },
+          PERMISSION_PROMPT_TIMEOUT_MS,
+        ),
+    };
+    setPermissionController(permissionController);
+
     credentialRegistry = new CredentialRegistry();
     const engineToolHandler = {
       handleToolCall: async (
@@ -994,6 +1378,17 @@ export async function activate(context: vscode.ExtensionContext) {
     lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
     lastObservedRevision = taskStore.getFile().revision;
 
+    if (taskStore.isCorrupt()) {
+      // The store could not be read (corrupt or written by a newer version). It is
+      // preserved and never overwritten; run in recovery mode instead of bricking.
+      const info = taskStore.getRecoveryInfo();
+      void vscode.window.showWarningMessage(
+        `Muster: the task store could not be read. Your data is preserved at ${
+          info?.backupPath ?? 'a .corrupt backup'
+        }. Muster is in recovery mode and will not overwrite it — remove or repair the file to resume.`,
+      );
+    }
+
     taskEngine = TaskEngine.load({
       store: taskStore,
       makeBackend,
@@ -1025,15 +1420,20 @@ export async function activate(context: vscode.ExtensionContext) {
       dispose: () => {
         void bridgeServer?.close();
         askBridge?.cancelAll('deactivate');
+        setPermissionController(null);
+        permissionBridge?.cancelAll();
         credentialRegistry?.revokeAll();
       },
     });
   } catch (error) {
     void bridgeServer?.close();
     askBridge?.cancelAll('init failed');
+    setPermissionController(null);
+    permissionBridge?.cancelAll();
     credentialRegistry?.revokeAll();
     bridgeServer = undefined;
     askBridge = undefined;
+    permissionBridge = undefined;
     credentialRegistry = undefined;
     taskEngine = undefined;
     taskStore = undefined;
@@ -1046,6 +1446,8 @@ export function deactivate() {
   presentationManager?.dispose();
   presentationManager = undefined;
   askBridge?.cancelAll('deactivate');
+  setPermissionController(null);
+  permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();
   disposeSharedAcpClient();

@@ -18,6 +18,24 @@ export interface TaskExecutionPolicy {
   turnTimeoutMs: number;
   taskTimeoutMs: number;
 }
+/**
+ * Agent-proposed outcome awaiting an authorized sealer (user, or coordinator under
+ * delegate mode). Does not change lifecycle until accepted. See TASK-MANAGEMENT §5.3.
+ */
+export type OutcomeProposal =
+  | {
+      kind: 'complete';
+      result: string;
+      proposedByTurnId: string;
+      proposedAt: string;
+    }
+  | {
+      kind: 'fail';
+      error: string;
+      proposedByTurnId: string;
+      proposedAt: string;
+    };
+
 export interface MusterTask {
   id: string;
   role: TaskRole;
@@ -30,9 +48,24 @@ export interface MusterTask {
   dependencies: TaskDependency[];
   wait?: PersistedWait;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
+  /**
+   * Backend conversation session for this task. Set after a successful turn
+   * (session/new or session/load). Next turns pass it as resumeId — process may
+   * stop between turns, but the session binding stays on the open task.
+   */
   committedSessionId?: string;
+  /**
+   * Workspace directory the agent runs in for this task's turns (schema-compatible:
+   * optional, absent value tolerated so no schema bump is required). Populated at
+   * task creation from the resolved workspace root; children inherit the parent's.
+   */
+  cwd?: string;
   capabilities: TaskCapability[];
   executionPolicy: TaskExecutionPolicy;
+  /** Staged complete/fail for root (human-gated) or display; not a lifecycle seal. */
+  outcomeProposal?: OutcomeProposal;
   result?: string;
   error?: string;
   revision: number;
@@ -153,8 +186,24 @@ export interface TaskStoreFile {
   reasoning?: Record<string, PersistedReasoning>;
 }
 
-// Derived view status (§4.3) — computed, never persisted
-export type TaskViewStatus =
-  | 'waiting_dependencies' | 'queued' | 'running' | 'waiting_user' | 'waiting_children'
-  | 'blocked' | 'needs_recovery' | 'idle'
-  | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+/**
+ * Derived runtime activity while lifecycle is `open` (never persisted).
+ * Independent of CLI success as a task outcome — see docs/TASK-MANAGEMENT.md §4.3.
+ */
+export type TaskRuntimeActivity =
+  | 'waiting_dependencies'
+  | 'queued'
+  | 'running'
+  | 'waiting_user'
+  | 'waiting_children'
+  | 'blocked'
+  | 'needs_recovery'
+  | 'idle'
+  | 'awaiting_outcome';
+
+/**
+ * Compact single-axis status for backward-compatible indexes and older UI.
+ * Prefer `lifecycle` + `runtimeActivity` for presentation.
+ * When lifecycle is terminal, equals lifecycle; when open, equals runtime activity.
+ */
+export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;

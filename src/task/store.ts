@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { deriveViewStatus } from './derived-status';
 import type { MusterTask, TaskLifecycleState, TaskMessage, TaskStoreFile, TaskTurn, TaskViewStatus } from './types';
 
@@ -16,9 +16,25 @@ export interface StoreOptions {
 
 export type ApplyResult = { ok: true } | { ok: false; reason: string };
 
+/**
+ * Recoverable-corruption signal. When the on-disk store cannot be parsed, the
+ * store quarantines a copy (see {@link TaskStore.getRecoveryInfo}) and exposes
+ * this instead of silently resetting the user's data. The extension host can use
+ * it to enter a read-only recovery mode and let the user choose to start fresh.
+ */
+export interface StoreCorruptInfo {
+  /** Path to the content-addressed `.corrupt-<hash>` quarantine copy. */
+  backupPath: string;
+  /** Parse-error detail. */
+  detail: string;
+  /** ISO timestamp the corruption was first observed. */
+  observedAt: string;
+}
+
 export type CommitResult =
   | { ok: true; revision: number; file: Readonly<TaskStoreFile> }
-  | { ok: false; reason: 'rejected' | 'io_error'; detail?: string };
+  | { ok: false; reason: 'rejected' | 'io_error'; detail?: string }
+  | { ok: false; reason: 'store_corrupt'; detail?: string; backupPath: string };
 
 interface LockRecord {
   pid: number;
@@ -71,11 +87,24 @@ function readLockRecord(lockPath: string): LockRecord | undefined {
   return undefined;
 }
 
-function sleep(ms: number): void {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    // busy-wait for short test-friendly sleeps without timers
+/**
+ * Synchronous, NON-SPINNING sleep. Parks the thread for `ms` without burning CPU by
+ * blocking on `Atomics.wait` against a throwaway zero-initialised SharedArrayBuffer that
+ * nothing ever notifies — so the wait always runs to its `ms` timeout. This is permitted
+ * on Node's main (extension-host) thread. It replaces the old `while (Date.now() < deadline)`
+ * busy-wait, which pinned a whole CPU core whenever multiple VS Code windows contended for
+ * the shared globalStorage store lock.
+ *
+ * NOTE: the store API (and `commit()`) stays fully SYNCHRONOUS on purpose — a sync→async
+ * lock refactor ripples across the entire engine and is out of scope here. A truly
+ * non-blocking async lock is a deliberate future follow-up; this change only removes the
+ * CPU burn, not the synchronous blocking.
+ */
+export function sleep(ms: number): void {
+  if (ms <= 0) {
+    return;
   }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFile {
@@ -134,11 +163,56 @@ function readFreshFile(filePath: string, schemaVersion: number): TaskStoreFile {
   }
 }
 
+/**
+ * Quarantine a corrupt store, keyed by a content hash rather than a timestamp.
+ * Identical corrupt bytes therefore map to the same `.corrupt-<hash>` backup, so
+ * repeated commits against the same corruption never accumulate an unbounded set
+ * of backup files. A genuinely different corruption hashes differently and gets
+ * its own distinct backup. Best-effort: quarantine must never mask the underlying
+ * corruption signal, so any IO failure here is swallowed.
+ */
 function preserveCorruptFile(filePath: string): string {
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const corruptPath = `${filePath}.corrupt-${stamp}`;
-  fs.copyFileSync(filePath, corruptPath);
+  let corruptPath = `${filePath}.corrupt`;
+  try {
+    const raw = fs.readFileSync(filePath);
+    const hash = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+    corruptPath = `${filePath}.corrupt-${hash}`;
+    if (!fs.existsSync(corruptPath)) {
+      fs.writeFileSync(corruptPath, raw);
+    }
+  } catch {
+    // best-effort — return the intended path even if the copy could not be made
+  }
   return corruptPath;
+}
+
+/**
+ * Read the store, recovering from an unparseable file instead of throwing. On a
+ * non-ENOENT parse/read failure the corrupt bytes are quarantined once
+ * (content-addressed) and a {@link StoreCorruptInfo} is returned alongside an
+ * empty in-memory envelope, so callers surface a recoverable state rather than
+ * bricking at startup or on external writes. The on-disk file is never modified
+ * here, so a subsequent commit still refuses to overwrite the user's data.
+ */
+function readFreshFileRecoverable(
+  filePath: string,
+  schemaVersion: number,
+): { file: TaskStoreFile; corruptInfo?: StoreCorruptInfo } {
+  try {
+    return { file: readFreshFile(filePath, schemaVersion) };
+  } catch (error) {
+    // readFreshFile only rethrows non-ENOENT (parse/read/migration) failures.
+    const err = error as NodeJS.ErrnoException;
+    const backupPath = preserveCorruptFile(filePath);
+    return {
+      file: emptyEnvelope(schemaVersion),
+      corruptInfo: {
+        backupPath,
+        detail: err.message ?? String(error),
+        observedAt: new Date().toISOString(),
+      },
+    };
+  }
 }
 
 function findRootId(file: TaskStoreFile, taskId: string): string | undefined {
@@ -294,6 +368,7 @@ export class TaskStore {
   private childIdsIndex = new Map<string, string[]>();
   private viewStatusIndex = new Map<string, TaskViewStatus>();
   private ownedLock: LockRecord | undefined;
+  private corruptInfo: StoreCorruptInfo | undefined;
 
   private constructor(filePath: string, schemaVersion: number, file: TaskStoreFile, opts: StoreOptions) {
     this.filePath = filePath;
@@ -308,17 +383,14 @@ export class TaskStore {
 
   static load(opts: StoreOptions): TaskStore {
     const schemaVersion = opts.schemaVersion ?? CURRENT_SCHEMA_VERSION;
-    try {
-      const file = readFreshFile(opts.filePath, schemaVersion);
-      return new TaskStore(opts.filePath, schemaVersion, file, opts);
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code === 'ENOENT') {
-        return new TaskStore(opts.filePath, schemaVersion, emptyEnvelope(schemaVersion), opts);
-      }
-      preserveCorruptFile(opts.filePath);
-      throw new Error(`Corrupt task store preserved; failed to parse ${opts.filePath}: ${err.message}`);
-    }
+    // A pre-existing corrupt store must not brick activation: recover into an empty
+    // in-memory envelope with the corruption signal set instead of throwing. The
+    // on-disk file is quarantined once and left untouched (commits refuse to write
+    // until it is readable), so the host can surface read-only recovery.
+    const { file, corruptInfo } = readFreshFileRecoverable(opts.filePath, schemaVersion);
+    const store = new TaskStore(opts.filePath, schemaVersion, file, opts);
+    store.corruptInfo = corruptInfo;
+    return store;
   }
 
   private refreshIndexes(): void {
@@ -332,12 +404,36 @@ export class TaskStore {
     return this.filePath;
   }
 
+  /**
+   * True when the most recent read observed an unparseable store. The on-disk
+   * data is preserved (never auto-reset); commits are refused with a
+   * `store_corrupt` result until the underlying file becomes readable again.
+   */
+  isCorrupt(): boolean {
+    return this.corruptInfo !== undefined;
+  }
+
+  /** Recovery details for a corrupt store, or undefined when healthy. */
+  getRecoveryInfo(): StoreCorruptInfo | undefined {
+    return this.corruptInfo;
+  }
+
   getFile(): Readonly<TaskStoreFile> {
     return this.file;
   }
 
   reload(): void {
-    this.file = readFreshFile(this.filePath, this.schemaVersion);
+    const { file, corruptInfo } = readFreshFileRecoverable(this.filePath, this.schemaVersion);
+    if (corruptInfo) {
+      // An external write left the file unparseable: keep the last-known-good
+      // in-memory state, surface the recoverable signal, and let commits refuse
+      // writes until the file is readable again. Never throw (would crash the
+      // file-watcher callback) and never overwrite the user's data.
+      this.corruptInfo = corruptInfo;
+      return;
+    }
+    this.file = file;
+    this.corruptInfo = undefined;
     this.refreshIndexes();
   }
 
@@ -451,6 +547,28 @@ export class TaskStore {
     return true;
   }
 
+  /**
+   * Run `fn` while holding the exclusive cross-process store lock, then release it.
+   * Returns `fn()`'s result, or `undefined` if the lock could not be acquired within the
+   * wait budget. Use this to SERIALIZE cross-process operations that touch sibling files
+   * (e.g. per-turn lease acquisition) so they cannot interleave across VS Code windows —
+   * closing read-then-mutate TOCTOU races that plain fs primitives cannot.
+   *
+   * `fn` MUST be short and MUST NOT call `commit()` or `runExclusive()` again: the lock is
+   * NOT re-entrant and doing so would deadlock.
+   */
+  runExclusive<T>(fn: () => T): T | undefined {
+    const lock = this.acquireLock();
+    if (!lock) {
+      return undefined;
+    }
+    try {
+      return fn();
+    } finally {
+      this.releaseLock(lock);
+    }
+  }
+
   private acquireLock(): LockRecord | undefined {
     // Defense in depth: ensure the lock's directory exists before acquiring. The
     // store path may be a not-yet-created globalStorage directory; a missing parent
@@ -500,11 +618,17 @@ export class TaskStore {
         if (err.code === 'ENOENT') {
           draft = emptyEnvelope(this.schemaVersion);
         } else {
-          preserveCorruptFile(this.filePath);
+          const backupPath = preserveCorruptFile(this.filePath);
+          this.corruptInfo = {
+            backupPath,
+            detail: err.message,
+            observedAt: new Date().toISOString(),
+          };
           result = {
             ok: false,
-            reason: 'io_error',
+            reason: 'store_corrupt',
             detail: `corrupt store preserved: ${err.message}`,
+            backupPath,
           };
           loadFailed = true;
           draft = emptyEnvelope(this.schemaVersion);
@@ -512,6 +636,9 @@ export class TaskStore {
       }
 
       if (!loadFailed) {
+        // A successful read means the store is readable again — clear any prior
+        // corruption signal so isCorrupt()/getRecoveryInfo() reflect the recovery.
+        this.corruptInfo = undefined;
         const before = cloneFile(draft);
         const applyResult = apply(draft);
         if (!applyResult.ok) {
@@ -524,8 +651,35 @@ export class TaskStore {
           let writeFailed = false;
           try {
             fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-            fs.writeFileSync(tempPath, JSON.stringify(draft, null, 2), 'utf8');
+            // Write the temp file through an fd and fsync it before the rename so the bytes
+            // are on stable storage first. rename() gives readers atomic visibility but NOT
+            // crash/power-loss durability; the fsync closes that gap.
+            const fd = fs.openSync(tempPath, 'w');
+            try {
+              // writeFileSync(fd, ...) writes the ENTIRE buffer (looping internally) or
+              // throws — unlike writeSync(fd, string), whose short-write return value we
+              // would otherwise have to check. A partial write here (e.g. disk full) must
+              // never be fsync'd + renamed as a "successful" commit: that would replace the
+              // store with truncated JSON. writeFileSync closes that gap.
+              fs.writeFileSync(fd, JSON.stringify(draft, null, 2), 'utf8');
+              fs.fsyncSync(fd);
+            } finally {
+              fs.closeSync(fd);
+            }
             fs.renameSync(tempPath, this.filePath);
+            // Best-effort: fsync the parent directory so the rename entry itself survives
+            // power loss on POSIX. Windows and some filesystems don't support directory
+            // fsync, so any failure here is swallowed and must not fail the commit.
+            try {
+              const dirFd = fs.openSync(path.dirname(this.filePath), 'r');
+              try {
+                fs.fsyncSync(dirFd);
+              } finally {
+                fs.closeSync(dirFd);
+              }
+            } catch {
+              // directory fsync unsupported on this platform/FS — ignore
+            }
           } catch (error) {
             try {
               fs.unlinkSync(tempPath);

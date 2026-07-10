@@ -3,10 +3,24 @@
   import { tasks, resolveBackendForSend, registerBackendSelect } from '../lib/tasks.svelte';
   import { post } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
-  import { getTaskStatusPresentation, isTaskStatusTerminal } from '../lib/task-status';
+  import {
+    getTaskPresentation,
+    getTaskStatusPresentation,
+    isHardTerminal,
+    runtimeBlocksComposer,
+  } from '../lib/task-status';
+  import {
+    CLI_LAST_EXIT_LABELS,
+    cliStatusFromTask,
+    getCliStatusPresentation,
+    type CliLastExit,
+  } from '../lib/cli-status';
   import type { AddContextAction } from '../lib/context-actions';
-  import type { PendingAsk, TaskViewStatus } from '../lib/protocol';
+  import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
+  import { effectiveRuntimeActivity } from '../lib/protocol';
   import type { WebviewBackendId } from '../lib/tasks.svelte';
+  import { BACKENDS, backendShortLabel } from '../lib/backends';
+  import { tip } from '../lib/tooltip';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -14,7 +28,12 @@
     turnId?: string | null;
     readOnly?: boolean;
     pendingAsk?: PendingAsk | null;
+    /** Preferred: full task summary for dual-axis status. */
+    task?: TaskSummary | null;
+    /** @deprecated Prefer `task`. Kept for callers that only have viewStatus. */
     taskStatus?: TaskViewStatus;
+    /** Optional last process exit (host may project later). */
+    cliLastExit?: CliLastExit | null;
   }
 
   let {
@@ -23,11 +42,34 @@
     turnId = null,
     readOnly = false,
     pendingAsk = null,
+    task = null,
     taskStatus = 'idle',
+    cliLastExit = null,
   }: Props = $props();
 
   const thread = $derived(threadStore.current);
-  const presentation = $derived(getTaskStatusPresentation(taskStatus));
+  const presentation = $derived(task ? getTaskPresentation(task) : getTaskStatusPresentation(taskStatus));
+  const runtime = $derived(task ? effectiveRuntimeActivity(task) : null);
+  const lifecycle = $derived(task?.lifecycle ?? (taskStatus as string));
+  const cliStatus = $derived(
+    task
+      ? cliStatusFromTask(task, {
+          // Generating only when streaming without a pending ask.
+          threadRunning: thread.running && !pendingAsk,
+          askPending: !!pendingAsk,
+          // Persist across reload: a committed session implies a prior process.
+          hadProcess: thread.hadProcess || !!task.committedSessionId,
+        })
+      : thread.running && !pendingAsk
+        ? ('running' as const)
+        : pendingAsk
+          ? ('idle' as const)
+          : ('not_started' as const),
+  );
+  const cliPresentation = $derived(getCliStatusPresentation(cliStatus));
+  const cliExitHint = $derived(
+    cliStatus === 'stopped' && cliLastExit ? CLI_LAST_EXIT_LABELS[cliLastExit] : null,
+  );
 
   let textareaEl = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
@@ -36,17 +78,30 @@
   let isAddContextMenuOpen = $state(false);
 
   const statusBlocksSend = $derived(
-    taskStatus === 'running' ||
-      taskStatus === 'queued' ||
-      taskStatus === 'waiting_dependencies' ||
-      taskStatus === 'waiting_children' ||
-      taskStatus === 'waiting_user' ||
-      taskStatus === 'needs_recovery' ||
-      isTaskStatusTerminal(taskStatus),
+    task
+      ? isHardTerminal(lifecycle) || runtimeBlocksComposer(runtime)
+      : taskStatus === 'running' ||
+          taskStatus === 'queued' ||
+          taskStatus === 'waiting_dependencies' ||
+          taskStatus === 'waiting_children' ||
+          taskStatus === 'waiting_user' ||
+          taskStatus === 'needs_recovery' ||
+          isHardTerminal(taskStatus),
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
   const canSend = $derived(mode === 'draft' ? !thread.running : !thread.running && !blocked);
-  const canCancel = $derived(mode === 'task' && taskStatus === 'running' && !!taskId && !!turnId);
+  // Stop applies while a process is up (generating or idle/waiting_user).
+  const canCancel = $derived(
+    mode === 'task' &&
+      (cliStatus === 'running' ||
+        cliStatus === 'idle' ||
+        runtime === 'running' ||
+        runtime === 'waiting_user' ||
+        taskStatus === 'running' ||
+        taskStatus === 'waiting_user') &&
+      !!taskId &&
+      !!turnId,
+  );
 
   const currentBackend = $derived(
     mode === 'draft' ? tasks.selectedBackend : (tasks.focusedTask?.backend ?? tasks.selectedBackend),
@@ -99,8 +154,15 @@
         type: 'send';
         text: string;
         backend: string;
+        model?: string;
         continuationOf?: string;
       } = { type: 'send', text: value, backend };
+      // Only deliver a model that belongs to the chosen backend's catalog. Before
+      // enumeration finishes (catalog null) trust the persisted selection.
+      const model = tasks.selectedModel;
+      if (model && (!tasks.modelsByBackend || modelInCatalog(backend, model))) {
+        payload.model = model;
+      }
       if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
       threadStore.current.appendTranscript({
         id: `local-${Date.now()}`,
@@ -215,15 +277,106 @@
   const disabledReason = $derived.by(() => {
     if (mode === 'draft') return '';
     if (pendingAsk) return 'Answer the pending task question above to continue.';
+    if (task) {
+      if (isHardTerminal(lifecycle)) return presentation.composerGuidance;
+      if (runtimeBlocksComposer(runtime)) return presentation.composerGuidance;
+      if (lifecycle === 'failed') return presentation.composerGuidance;
+      if (readOnly) return 'This task is read-only right now.';
+      return '';
+    }
     if (taskStatus === 'running') return presentation.composerGuidance;
     if (taskStatus === 'queued') return presentation.composerGuidance;
     if (taskStatus === 'waiting_dependencies') return presentation.composerGuidance;
     if (taskStatus === 'waiting_children') return presentation.composerGuidance;
     if (taskStatus === 'waiting_user') return presentation.composerGuidance;
     if (taskStatus === 'needs_recovery') return presentation.composerGuidance;
-    if (isTaskStatusTerminal(taskStatus)) return presentation.composerGuidance;
+    if (taskStatus === 'awaiting_outcome') return presentation.composerGuidance;
+    if (isHardTerminal(taskStatus)) return presentation.composerGuidance;
+    if (taskStatus === 'failed') return presentation.composerGuidance;
     if (readOnly) return 'This task is read-only right now.';
     return '';
+  });
+
+  // Only offer backends whose CLI the host reports as installed. Until that is
+  // known (null) — or if nothing was detected — fail open and show all.
+  const pickerBackends = $derived.by(() => {
+    const avail = tasks.availableBackends;
+    if (!avail || avail.length === 0) return BACKENDS;
+    const filtered = BACKENDS.filter((b) => avail.includes(b.id));
+    return filtered.length > 0 ? filtered : BACKENDS;
+  });
+
+  // Grouped model picker: one `[Backend] Model` option per enumerated model.
+  // Until the host reports models, fall back to plain per-backend options.
+  const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
+  const modelsLoading = $derived(mode === 'draft' && !modelsLoaded);
+
+  const pickerOptions = $derived.by(() => {
+    const models = tasks.modelsByBackend;
+    if (models && Object.keys(models).length > 0) {
+      const opts: { value: string; label: string }[] = [];
+      for (const be of pickerBackends) {
+        const m = models[be.id];
+        if (m && m.options.length > 0) {
+          for (const o of m.options) {
+            opts.push({ value: `${be.id}::${o.value}`, label: `[${backendShortLabel(be.id)}] ${o.name}` });
+          }
+        } else {
+          // Backend installed but no model list yet (still enumerating) or none advertised.
+          opts.push({
+            value: be.id,
+            label: modelsLoading ? `${be.label} (loading models…)` : be.label,
+          });
+        }
+      }
+      if (opts.length > 0) return opts;
+    }
+    return pickerBackends.map((b) => ({
+      value: b.id,
+      label: modelsLoading ? `${b.label} (loading models…)` : b.label,
+    }));
+  });
+
+  function modelInCatalog(backend: string, model: string): boolean {
+    return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
+  }
+
+  // Encoded value the select should show — always an option that exists in
+  // `pickerOptions`. Until models load (or for a backend with none) that is the
+  // plain backend id; otherwise the chosen model, else the backend's default.
+  const currentPickerValue = $derived.by(() => {
+    if (!modelsLoaded) return currentBackend;
+    const m = tasks.modelsByBackend?.[currentBackend];
+    if (m && m.options.length > 0) {
+      const chosen =
+        tasks.selectedModel && modelInCatalog(currentBackend, tasks.selectedModel)
+          ? tasks.selectedModel
+          : (m.current ?? m.options[0].value);
+      return `${currentBackend}::${chosen}`;
+    }
+    return currentBackend;
+  });
+
+  // Remount key so vscode-single-select rebuilds options when the catalog arrives
+  // (web components often ignore Svelte re-rendering child <vscode-option>s).
+  // Only remount when the option *set* changes — not when the selected value changes.
+  const pickerRemountKey = $derived(
+    modelsLoaded
+      ? `models:${pickerOptions.map((o) => o.value).join('|')}`
+      : `backends:${pickerBackends.map((b) => b.id).join(',')}:loading`,
+  );
+
+  // Ensure host starts enumeration when the draft composer is shown (also
+  // prefetched on App mount / panel resolve).
+  let draftModelsRequested = false;
+  $effect(() => {
+    if (mode === 'draft' && !draftModelsRequested) {
+      draftModelsRequested = true;
+      post({ type: 'listModels' });
+    }
+    if (mode !== 'draft') {
+      draftModelsRequested = false;
+    }
   });
 
   const placeholder = $derived(
@@ -234,11 +387,20 @@
         : `Message this task…`,
   );
 
+  const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
+
   function onBackendChange(e: Event) {
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
-    const next = el?.value;
-    if (next === 'claude' || next === 'grok' || next === 'kiro' || next === 'codex' || next === 'opencode') {
-      tasks.setBackend(next as WebviewBackendId);
+    const raw = el?.value ?? '';
+    const sep = raw.indexOf('::');
+    if (sep >= 0) {
+      const backend = raw.slice(0, sep);
+      const model = raw.slice(sep + 2);
+      if (BACKEND_IDS.includes(backend)) {
+        tasks.setModelSelection(backend as WebviewBackendId, model);
+      }
+    } else if (BACKEND_IDS.includes(raw)) {
+      tasks.setBackend(raw as WebviewBackendId);
     }
   }
 </script>
@@ -251,6 +413,27 @@
   ondragleave={onDragLeave}
   ondrop={onDrop}
 >
+  {#if mode === 'task'}
+    <div
+      class={`cli-status-bar cli-status-bar--${cliPresentation.tone}`}
+      data-cli-status={cliStatus}
+      role="status"
+      aria-live="polite"
+      use:tip={cliPresentation.detail}
+    >
+      <span
+        class="codicon codicon-{cliPresentation.icon}"
+        class:codicon-modifier-spin={cliStatus === 'running'}
+        aria-hidden="true"
+      ></span>
+      <span class="cli-status-bar__label">{cliPresentation.label}</span>
+      <span class="cli-status-bar__sep" aria-hidden="true">·</span>
+      <span class="cli-status-bar__hint">
+        {cliExitHint ?? cliPresentation.hint}
+      </span>
+    </div>
+  {/if}
+
   {#if disabledReason}
     <div class="composer-guidance" role="note">{disabledReason}</div>
   {/if}
@@ -267,29 +450,31 @@
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
       {#if mode === 'draft'}
-        <vscode-single-select
-          bind:this={backendSelect}
-          value={currentBackend}
-          title="Select CLI / model for new task"
-          disabled={thread.running}
-          position="above"
-          onchange={onBackendChange}
-          oninput={onBackendChange}
-          style="width: fit-content; min-width: fit-content;"
-        >
-          <vscode-option value="claude">Claude</vscode-option>
-          <vscode-option value="grok">Grok</vscode-option>
-          <vscode-option value="kiro">Kiro</vscode-option>
-          <vscode-option value="codex">Codex</vscode-option>
-          <vscode-option value="opencode">OpenCode</vscode-option>
-        </vscode-single-select>
+        {#key pickerRemountKey}
+          <vscode-single-select
+            bind:this={backendSelect}
+            value={currentPickerValue}
+            use:tip={modelsLoaded
+              ? 'Select backend + model for the new task'
+              : 'Loading models from installed CLIs… (shows backends first)'}
+            disabled={thread.running}
+            position="above"
+            onchange={onBackendChange}
+            oninput={onBackendChange}
+            style="width: fit-content; min-width: fit-content; max-width: 100%;"
+          >
+            {#each pickerOptions as opt (opt.value)}
+              <vscode-option value={opt.value}>{opt.label}</vscode-option>
+            {/each}
+          </vscode-single-select>
+        {/key}
       {:else}
         <div
           class="px-2 py-0.5 text-xs rounded border truncate"
           style="border-color: var(--vscode-panel-border); opacity: 0.85;"
-          title="Backend for this task"
+          use:tip={'Backend for this task'}
         >
-          {currentBackend}
+          {backendShortLabel(currentBackend)}
         </div>
       {/if}
 
@@ -297,10 +482,10 @@
         <button
           type="button"
           class="icon-btn add-context__button"
-          title="Add Context"
           aria-label="Add Context"
           aria-haspopup="menu"
           aria-expanded={isAddContextMenuOpen ? 'true' : 'false'}
+          use:tip={'Add Context'}
           onclick={toggleAddContextMenu}
           disabled={!canSend}
         >
@@ -331,26 +516,55 @@
         {/if}
       </div>
 
-      <button type="button" class="icon-btn opacity-60" style="width: 20px; height: 20px;" title="Config" disabled>
+      <!-- Config button (placeholder) -->
+      <button
+        type="button"
+        class="icon-btn opacity-60"
+        style="width: 20px; height: 20px;"
+        aria-label="Config"
+        use:tip={'Config'}
+        disabled
+      >
         <span class="codicon codicon-gear"></span>
       </button>
     </div>
 
     <div class="flex items-center gap-2">
       {#if canCancel}
-        <button type="button" class="icon-btn" style="width: 28px; height: 28px;" onclick={cancel} title="Stop">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 28px; height: 28px;"
+          onclick={cancel}
+          aria-label="Stop"
+          use:tip={'Stop'}
+        >
           <span class="codicon codicon-debug-stop"></span>
         </button>
       {:else if canSend}
-        <button type="button" class="icon-btn" style="width: 28px; height: 28px;" onclick={send} title="Send">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 28px; height: 28px;"
+          onclick={send}
+          aria-label="Send"
+          use:tip={'Send'}
+        >
           <span class="codicon codicon-send"></span>
         </button>
-      {:else if taskStatus === 'queued' && turnId}
+      {:else if (runtime === 'queued' || taskStatus === 'queued') && turnId}
         <span class="task-muted text-xs">Queued turn is waiting to resume.</span>
-      {:else if taskStatus === 'needs_recovery' && !turnId}
+      {:else if (runtime === 'needs_recovery' || taskStatus === 'needs_recovery') && !turnId}
         <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
       {:else if thread.running}
-        <button type="button" class="icon-btn" style="width: 28px; height: 28px;" disabled title="Running…">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 28px; height: 28px;"
+          disabled
+          aria-label="Running…"
+          use:tip={'Running…'}
+        >
           <span class="codicon codicon-loading"></span>
         </button>
       {/if}

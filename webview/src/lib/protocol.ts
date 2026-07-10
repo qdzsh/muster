@@ -1,9 +1,36 @@
 import { vscode } from './vscode';
 import type { NormalizedEvent, Question } from './types';
 
+/**
+ * Wire protocol version for the host<->webview message channel ("protocol v2").
+ * Single source of truth: the webview imports this constant; the host keeps a
+ * duplicated copy in src/extension.ts because it cannot import this module (the
+ * module graph has browser-only side effects via acquireVsCodeApi). The version
+ * is stamped on the bootstrap `snapshot` message so either side can detect drift
+ * once, instead of silently dropping mismatched messages. Bump this on any
+ * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
+ * src/extension.ts).
+ */
+export const PROTOCOL_VERSION = 2;
+
+/**
+ * Decide whether a peer's advertised protocol version is compatible with ours.
+ * Same integer => compatible. A different version OR an absent/non-numeric one
+ * (an old peer that predates version stamping) => incompatible, so the caller
+ * can surface a visible "reload the window" diagnostic instead of silently
+ * proceeding against a drifted peer. Pure and side-effect free (unit-tested).
+ */
+export function isProtocolCompatible(theirVersion: unknown): boolean {
+  return theirVersion === PROTOCOL_VERSION;
+}
+
 export type TurnTrigger = 'user' | 'engine' | 'retry';
 
-export type TaskViewStatus =
+/** Persisted work outcome — primary task badge. */
+export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+
+/** Derived CLI/deps/wait activity while open — secondary chrome. */
+export type TaskRuntimeActivity =
   | 'waiting_dependencies'
   | 'queued'
   | 'running'
@@ -12,18 +39,27 @@ export type TaskViewStatus =
   | 'blocked'
   | 'needs_recovery'
   | 'idle'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
-  | 'skipped';
+  | 'awaiting_outcome';
+
+/**
+ * Compact single-axis status (host still sends for compatibility).
+ * Prefer lifecycle + runtimeActivity for UI.
+ */
+export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 
 export interface TaskSummary {
   id: string;
   parentId: string | null;
   goal: string;
   role: string;
-  lifecycle: string;
+  lifecycle: TaskLifecycleState | string;
+  /** Present when host supports dual-axis status; null when lifecycle is terminal. */
+  runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
+  /** Backend session bound to this task for resume across process restarts. */
+  committedSessionId?: string;
+  /** Agent proposed complete/fail while lifecycle remains open. */
+  hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
   continuationOf?: string;
@@ -44,8 +80,33 @@ export interface PendingAsk {
   questions: Question[];
 }
 
+/** Coarse risk class for a tool-permission request (mirrors the host). */
+export type PermissionClass = 'read' | 'write' | 'unknown';
+
+/** An option offered by the agent on a permission request. */
+export interface PermissionOptionView {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+export interface PendingPermission {
+  sessionId: string;
+  permissionId: string;
+  title: string;
+  kind: string;
+  classification: PermissionClass;
+  options: PermissionOptionView[];
+}
+
 export interface SnapshotMessage {
   type: 'snapshot';
+  /**
+   * Wire protocol version stamped by the host on this bootstrap message; see
+   * PROTOCOL_VERSION. Optional so an older host that predates version stamping
+   * still type-checks — its absence is treated as an (incompatible) mismatch.
+   */
+  protocolVersion?: number;
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
@@ -93,6 +154,16 @@ export interface SettingsUpdateResultMessage {
   result: SettingsUpdateResult;
 }
 
+/** A backend's selectable models, reported by the host for the model picker. */
+export interface BackendModelOption {
+  value: string;
+  name: string;
+}
+export interface BackendModels {
+  current?: string;
+  options: BackendModelOption[];
+}
+
 // Extension host -> webview (protocol v2, TASK-MODEL-PHASE-D-PLAN §4.1)
 export type ExtMessage =
   | SnapshotMessage
@@ -106,20 +177,34 @@ export type ExtMessage =
   | { type: 'transcriptAppend'; taskId: string; item: TranscriptItem }
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
+  | {
+      type: 'permissionPending';
+      sessionId: string;
+      permissionId: string;
+      title: string;
+      kind: string;
+      classification: PermissionClass;
+      options: PermissionOptionView[];
+    }
+  | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
-  | { type: 'filePicked'; path: string };
+  | { type: 'filePicked'; path: string }
+  | { type: 'backendsAvailable'; backends: string[] }
+  | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
 // Webview -> extension host (protocol v2)
 export type OutMessage =
-  | { type: 'send'; taskId?: string; text: string; backend?: string; continuationOf?: string }
+  | { type: 'send'; taskId?: string; text: string; backend?: string; model?: string; continuationOf?: string }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
   | { type: 'newTask' }
   | { type: 'cancelTurn'; taskId: string; turnId: string }
   | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
   | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
+  | { type: 'submitPermission'; permissionId: string; optionId: string; remember: boolean }
+  | { type: 'cancelPermission'; permissionId: string }
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
   | { type: 'continueTask'; taskId: string; instruction: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
@@ -128,8 +213,21 @@ export type OutMessage =
   | { type: 'resolveFileDrop'; candidates: string[] }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
+  | { type: 'deleteTask'; taskId: string }
+  | { type: 'renameTask'; taskId: string; goal: string }
+  | { type: 'blurTask' }
   | { type: 'requestSettings' }
-  | { type: 'updateSetting'; settingId: RetentionSettingId; value: number };
+  | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
+  | { type: 'listBackends' }
+  | { type: 'listModels' }
+  /** User sets task lifecycle (not CLI-driven). */
+  | {
+      type: 'setTaskLifecycle';
+      taskId: string;
+      lifecycle: 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+      result?: string;
+      error?: string;
+    };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -284,6 +382,11 @@ function isQuestion(v: unknown): v is Question {
   return isString(v.prompt);
 }
 
+function isPermissionOption(v: unknown): v is PermissionOptionView {
+  if (!isRecord(v)) return false;
+  return isString(v.optionId) && isString(v.name) && isString(v.kind);
+}
+
 const TURN_SCOPED_TYPES = new Set([
   'turnStart',
   'event',
@@ -306,6 +409,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
   switch (t) {
     case 'snapshot':
       return (
+        (data.protocolVersion === undefined || isNumber(data.protocolVersion)) &&
         Array.isArray(data.rootTasks) &&
         data.rootTasks.every(isTaskSummary) &&
         isNumber(data.storeRevision) &&
@@ -351,21 +455,85 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'askCleared':
       return isString(data.askId);
 
+    case 'permissionPending':
+      return (
+        isString(data.sessionId) &&
+        isString(data.permissionId) &&
+        isString(data.title) &&
+        isString(data.kind) &&
+        isString(data.classification) &&
+        Array.isArray(data.options) &&
+        data.options.every(isPermissionOption)
+      );
+
+    case 'permissionCleared':
+      return isString(data.permissionId);
+
     case 'commandError':
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
 
     case 'filePicked':
       return isString(data.path);
 
+    case 'backendsAvailable':
+      return Array.isArray(data.backends) && data.backends.every(isString);
+
+    case 'modelsAvailable':
+      return typeof data.models === 'object' && data.models !== null;
+
     default:
       return false;
   }
 }
 
-export function isTerminalStatus(status: TaskViewStatus): boolean {
+/** Any sealed lifecycle (including soft failed). Prefer hard/soft helpers for UX. */
+export function isTerminalStatus(status: TaskViewStatus | string): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled' || status === 'skipped';
 }
 
-export function statusLabel(status: TaskViewStatus): string {
-  return status.replace(/_/g, ' ');
+/** Hard terminal: thread read-only; follow-up is a new task. */
+export function isHardTerminalLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'succeeded' || lifecycle === 'cancelled' || lifecycle === 'skipped';
+}
+
+/** Soft terminal: same task may reopen on send. */
+export function isSoftTerminalLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'failed';
+}
+
+export function isOpenLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'open';
+}
+
+export function statusLabel(status: TaskViewStatus | string): string {
+  const s = status.replace(/_/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** Effective runtime activity from summary (host field or fall back from viewStatus). */
+export function effectiveRuntimeActivity(
+  task: Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'>,
+): TaskRuntimeActivity | null {
+  if (task.lifecycle !== 'open') {
+    return null;
+  }
+  if (task.runtimeActivity !== undefined) {
+    return task.runtimeActivity;
+  }
+  // Older hosts: viewStatus holds runtime when open.
+  const vs = task.viewStatus;
+  if (
+    vs === 'waiting_dependencies' ||
+    vs === 'queued' ||
+    vs === 'running' ||
+    vs === 'waiting_user' ||
+    vs === 'waiting_children' ||
+    vs === 'blocked' ||
+    vs === 'needs_recovery' ||
+    vs === 'idle' ||
+    vs === 'awaiting_outcome'
+  ) {
+    return vs;
+  }
+  return 'idle';
 }

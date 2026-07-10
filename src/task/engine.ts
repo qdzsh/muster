@@ -25,6 +25,7 @@ import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './l
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
 import {
+  applyDependencyTerminal,
   applyFailedTurn,
   applySuccessfulTurn,
   createTask,
@@ -37,10 +38,13 @@ import {
   startProcess,
   startTask as transitionStartTask,
   continueTask as transitionContinueTask,
-  applyDependencyTerminal,
   cancelPendingTurn,
   cancelTask as transitionCancelTask,
+  hasActiveOrQueuedTurn,
+  isHardTerminalLifecycle,
   isTerminalLifecycle,
+  reopenSoftFailedTask,
+  setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
   type Effect,
 } from './transitions';
@@ -88,10 +92,24 @@ export type EngineResult<T> =
   | { ok: true; value: T }
   | { ok: false; reason: string };
 
-interface LockRecord {
+export interface LeaseRecord {
   pid: number;
   token: string;
+  /**
+   * ISO timestamp the lease was acquired. Absent on legacy records written before this
+   * field existed; a missing/unparseable value is treated as "very old" → reclaimable.
+   */
+  createdAt?: string;
 }
+
+/**
+ * Max age a lease may reach before it is presumed abandoned and becomes reclaimable even
+ * if its PID still appears alive. This defeats PID reuse: a recycled PID that happens to
+ * match a dead owner's PID can no longer keep a stale lease "alive" forever. Sized to the
+ * default task timeout — the longest a task (and therefore any of its turns/leases) can
+ * legitimately run before it is force-cancelled anyway.
+ */
+export const MAX_LEASE_AGE_MS = 1_800_000;
 
 const DEFAULT_POLICY: TaskExecutionPolicy = {
   maxTurns: 50,
@@ -116,9 +134,9 @@ function isProcessDead(pid: number): boolean {
   }
 }
 
-function readLockRecord(lockPath: string): LockRecord | undefined {
+function readLockRecord(lockPath: string): LeaseRecord | undefined {
   try {
-    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as LockRecord;
+    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as LeaseRecord;
     if (typeof parsed.pid === 'number' && typeof parsed.token === 'string') {
       return parsed;
     }
@@ -128,37 +146,133 @@ function readLockRecord(lockPath: string): LockRecord | undefined {
   return undefined;
 }
 
-function leasePath(storePath: string, turnId: string): string {
+export function leasePath(storePath: string, turnId: string): string {
   return `${storePath}.lease.${turnId}`;
 }
 
-function tryAcquireLease(storePath: string, turnId: string): LockRecord | undefined {
-  const path = leasePath(storePath, turnId);
-  const record: LockRecord = { pid: process.pid, token: randomBytes(16).toString('hex') };
+/**
+ * A lease is reclaimable when it is missing/empty/unparseable, owned by a dead PID, or
+ * older than {@link MAX_LEASE_AGE_MS}. A legacy record without `createdAt` is treated as
+ * very old → reclaimable. This is the single source of truth for both acquisition
+ * (reclaiming a stale lease) and reload reconciliation (deciding a turn is orphaned).
+ */
+export function isLeaseReclaimable(record: LeaseRecord | undefined): boolean {
+  if (!record) {
+    return true;
+  }
+  if (isProcessDead(record.pid)) {
+    return true;
+  }
+  if (!record.createdAt) {
+    return true;
+  }
+  const created = Date.parse(record.createdAt);
+  if (Number.isNaN(created)) {
+    return true;
+  }
+  return Date.now() - created > MAX_LEASE_AGE_MS;
+}
+
+/**
+ * Reclaim a stale lease safely, mirroring the store lock's {@link TaskStore} reclaim.
+ * Never disturbs a live, well-formed lease. A suspicious lease is claimed atomically via
+ * rename — only one contender can win that rename, and each operates on the exact file
+ * instance it removed — which closes the read-then-unlink TOCTOU where a stale read could
+ * otherwise delete a freshly published live lease (letting two engines run one turn).
+ * Returns true when the path was freed (a retry can now acquire).
+ */
+function reclaimStaleLease(target: string): boolean {
+  const observed = readLockRecord(target);
+  if (!isLeaseReclaimable(observed)) {
+    return false;
+  }
+  // Looks stale (empty/corrupt, dead owner, or over max-age). Claim it atomically by
+  // renaming it aside rather than unlinking the path in place.
+  const quarantine = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.stale`;
   try {
-    const fd = fs.openSync(path, 'wx');
-    fs.writeFileSync(fd, JSON.stringify(record), 'utf8');
-    fs.closeSync(fd);
+    fs.renameSync(target, quarantine);
+  } catch (error) {
+    // ENOENT: another contender already reclaimed it — the path is free now, so a retry
+    // can acquire. Any other error: leave the lease untouched.
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  // We now exclusively hold whatever WAS at `target`. Re-inspect that exact instance.
+  const claimed = readLockRecord(quarantine);
+  if (!isLeaseReclaimable(claimed)) {
+    // Rare race: a fresh, live lease was published between the observation and the rename.
+    // Best-effort restore so its owner is not silently displaced.
+    try {
+      fs.linkSync(quarantine, target);
+    } catch {
+      // target already re-taken by another acquirer; nothing safe to do
+    }
+    try {
+      fs.unlinkSync(quarantine);
+    } catch {
+      // best-effort
+    }
+    return false;
+  }
+  // Confirmed stale — discard it. `target` is now free for a retry.
+  try {
+    fs.unlinkSync(quarantine);
+  } catch {
+    // best-effort
+  }
+  return true;
+}
+
+export function tryAcquireLease(storePath: string, turnId: string): LeaseRecord | undefined {
+  const target = leasePath(storePath, turnId);
+  const record: LeaseRecord = {
+    pid: process.pid,
+    token: randomBytes(16).toString('hex'),
+    createdAt: new Date().toISOString(),
+  };
+  // Write the full record to a private temp file first, then publish it with an atomic,
+  // exclusive hard link. This mirrors the store lock's temp+link pattern: the lease path
+  // is therefore either absent or a fully-written record — never an empty/partial file,
+  // even if this process is killed mid-acquire. (The old openSync('wx')+writeFileSync
+  // could leave an EMPTY lease on a crash, which then permanently blocked that turn's
+  // lease — a deadlock, since readLockRecord returned undefined and the reclaim path
+  // refused it.)
+  const tmpPath = `${target}.${process.pid}.${record.token}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(record), 'utf8');
+  } catch {
+    return undefined;
+  }
+  try {
+    fs.linkSync(tmpPath, target);
     return record;
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code !== 'EEXIST') {
       return undefined;
     }
-    const existing = readLockRecord(path);
-    if (!existing || !isProcessDead(existing.pid)) {
+    // A lease is present. Reclaim it only if stale, then retry the atomic publish once.
+    // reclaimStaleLease claims via rename (never unlinks the path after a stale read), so
+    // it cannot delete a lease a peer published in the meantime.
+    if (!reclaimStaleLease(target)) {
       return undefined;
     }
     try {
-      fs.unlinkSync(path);
+      fs.linkSync(tmpPath, target);
+      return record;
     } catch {
+      // Another contender re-took the freed path first — let the caller retry later.
       return undefined;
     }
-    return tryAcquireLease(storePath, turnId);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // best-effort: an orphaned temp is harmless and uniquely named
+    }
   }
 }
 
-function releaseLease(storePath: string, turnId: string, record: LockRecord): void {
+function releaseLease(storePath: string, turnId: string, record: LeaseRecord): void {
   const path = leasePath(storePath, turnId);
   const existing = readLockRecord(path);
   if (existing?.pid === record.pid && existing.token === record.token) {
@@ -170,12 +284,11 @@ function releaseLease(storePath: string, turnId: string, record: LockRecord): vo
   }
 }
 
-function leaseOwnerAlive(storePath: string, turnId: string): boolean {
-  const existing = readLockRecord(leasePath(storePath, turnId));
-  if (!existing) {
-    return false;
-  }
-  return !isProcessDead(existing.pid);
+export function leaseOwnerAlive(storePath: string, turnId: string): boolean {
+  // "Alive" means a non-reclaimable lease: a live owner holding a fresh, well-formed
+  // record. A dead PID, empty/corrupt file, or an over-age lease (PID-reuse defense) all
+  // count as not-alive, so reload reconciliation reclaims the orphaned turn.
+  return !isLeaseReclaimable(readLockRecord(leasePath(storePath, turnId)));
 }
 
 function ownsLocalLease(storePath: string, turnId: string): boolean {
@@ -287,7 +400,7 @@ function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): str
   return `${failedTurnId}-auto-retry-${retryIndex}`;
 }
 
-function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
+export function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
   const task = draft.tasks[taskId];
   if (!task) {
     return undefined;
@@ -439,10 +552,14 @@ export class TaskEngine {
   startNewTask(params: {
     goal: string;
     backend: string;
+    /** Model id selected for this task (ACP session config option value). */
+    model?: string;
     continuationOf?: string;
     role?: TaskRole;
     /** Full content of the first user message. If not provided, falls back to goal. */
     message?: string;
+    /** Workspace directory the agent runs in for this task's turns. */
+    cwd?: string;
   }): EngineResult<{ taskId: string; messageId: string; turnId: string }> {
     const backend = this.makeBackend(params.backend);
     if (!canBindTaskToBackend(backend.capabilities)) {
@@ -461,6 +578,8 @@ export class TaskEngine {
       parentId: null,
       dependencies: [],
       backend: params.backend,
+      model: params.model,
+      cwd: params.cwd,
       capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
       executionPolicy: DEFAULT_POLICY,
     };
@@ -586,6 +705,8 @@ export class TaskEngine {
     dependencies?: TaskDependency[];
     capabilities?: TaskCapability[];
     executionPolicy?: TaskExecutionPolicy;
+    /** Workspace directory the agent runs in for this task's turns. */
+    cwd?: string;
   }): EngineResult<{ taskId: string }> {
     const backend = this.makeBackend(params.backend);
     if (!canBindTaskToBackend(backend.capabilities)) {
@@ -601,6 +722,7 @@ export class TaskEngine {
       parentId: null,
       dependencies: params.dependencies ?? [],
       backend: params.backend,
+      cwd: params.cwd,
       capabilities: params.capabilities ?? ['create_child', 'start_child', 'wait_child', 'read_subtree'],
       executionPolicy: params.executionPolicy ?? DEFAULT_POLICY,
     };
@@ -630,14 +752,36 @@ export class TaskEngine {
     let queuedTurnId: string | undefined;
 
     const commit = this.store.commit((draft) => {
-      const draftTask = draft.tasks[taskId];
+      let draftTask = draft.tasks[taskId];
       if (!draftTask) {
         return { ok: false, reason: 'task not found' };
       }
-      if (isTerminalLifecycle(draftTask.lifecycle)) {
+      // Hard terminal: read-only. Soft failed: reopen to open on the same task id.
+      if (isHardTerminalLifecycle(draftTask.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
       }
+      if (draftTask.lifecycle === 'failed') {
+        const reopened = reopenSoftFailedTask(draftTask, { now });
+        if (!reopened.ok) {
+          return reopened;
+        }
+        draft.tasks[taskId] = reopened.next;
+        draftTask = reopened.next;
+      }
 
+      // New user message supersedes a pending outcome proposal (implicit continue).
+      if (draftTask.outcomeProposal) {
+        draftTask = {
+          ...draftTask,
+          outcomeProposal: undefined,
+          revision: draftTask.revision + 1,
+          updatedAt: now,
+        };
+        draft.tasks[taskId] = draftTask;
+      }
+
+      // Queue a turn when open and no live/queued turn — including after a
+      // successful prior turn (resume session via committedSessionId) or recovery.
       const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
       draft.messages[messageId] = {
         id: messageId,
@@ -648,7 +792,14 @@ export class TaskEngine {
         createdAt: now,
       };
 
-      if (viewStatus === 'idle') {
+      // Allow continue when idle, awaiting_outcome (proposal cleared above), or
+      // needs_recovery is handled by explicit retry — but plain send on idle after
+      // stopped CLI must always queue a continuation turn.
+      if (
+        viewStatus === 'idle' ||
+        viewStatus === 'awaiting_outcome' ||
+        (viewStatus === 'needs_recovery' && !hasActiveOrQueuedTurn(turnsForTask(draft, taskId)))
+      ) {
         const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
         if (!turnCap.ok) {
           return turnCap;
@@ -816,6 +967,198 @@ export class TaskEngine {
     return { ok: true, value: { turnId: newTurnId } };
   }
 
+  /**
+   * User (or host UI) sets task lifecycle. Never driven by CLI process status.
+   * Cancels/interrupts live turns when sealing terminal outcomes.
+   * For `skipped`, cascades to unfinished descendants (see skipTask).
+   */
+  setTaskLifecycle(
+    taskId: string,
+    lifecycle: TaskLifecycleState,
+    options?: { result?: string; error?: string },
+  ): EngineResult<void> {
+    if (lifecycle === 'skipped') {
+      return this.skipTask(taskId);
+    }
+
+    const now = nowIso(this.clock);
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) {
+      return { ok: false, reason: 'task not found' };
+    }
+
+    const turns = this.store.getTurnsForTask(taskId);
+    const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
+    const remoteOwned =
+      !!live &&
+      leaseOwnerAlive(this.storePath, live.id) &&
+      !ownsLocalLease(this.storePath, live.id);
+
+    if (live && lifecycle !== 'open' && !remoteOwned) {
+      this.liveRuns.get(live.id)?.abort();
+    }
+
+    const commit = this.store.commit((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task) {
+        return { ok: false, reason: 'task not found' };
+      }
+
+      // Remote-owned live turn: request interrupt (not cancel). We already seal
+      // lifecycle here; remote processCancelRequests cancel branch would call
+      // transitionCancelTask and fail once the task is terminal.
+      if (live && lifecycle !== 'open' && remoteOwned) {
+        draft.cancelRequests = draft.cancelRequests ?? {};
+        draft.cancelRequests[live.id] = {
+          kind: 'interrupt',
+          by: 'engine',
+          opId: `lifecycle-${lifecycle}-${taskId}`,
+          at: now,
+        };
+      }
+
+      const result = transitionSetTaskLifecycle(task, lifecycle, {
+        now,
+        result: options?.result,
+        error: options?.error,
+        sealedBy: 'user',
+      });
+      if (!result.ok) {
+        return result;
+      }
+      draft.tasks[taskId] = result.next;
+
+      // When sealing terminal, settle live/queued turns without leaving zombies.
+      // Skip remote-owned live turns (handled via cancelRequests).
+      if (lifecycle !== 'open') {
+        const pending = Object.values(draft.turns).filter(
+          (t) =>
+            t.taskId === taskId &&
+            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+        );
+        for (const p of pending) {
+          if (live && remoteOwned && p.id === live.id) {
+            continue;
+          }
+          if (p.status === 'queued') {
+            const cancelled = cancelPendingTurn(p, { now });
+            if (cancelled.ok) draft.turns[p.id] = cancelled.next;
+          } else {
+            const interrupted = interruptTurn(p, { now });
+            if (interrupted.ok) {
+              draft.turns[p.id] = {
+                ...interrupted.next,
+                isCancellation: lifecycle === 'cancelled',
+              };
+            }
+          }
+        }
+      }
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+
+    if (live && !remoteOwned) {
+      this.askBridge.cancelForTurn(live.id, 'task lifecycle changed');
+      this.credentialRegistry?.revoke(live.id);
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /**
+   * Skip task + unfinished descendants (user or authorized coordinator).
+   * Hard terminal: won’t perform. Live turns are interrupted first.
+   */
+  skipTask(taskId: string): EngineResult<void> {
+    const now = nowIso(this.clock);
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) {
+      return { ok: false, reason: 'task not found' };
+    }
+
+    const taskIds = [taskId, ...descendantIds(file, taskId)].reverse();
+    const liveTurnIds = taskIds.flatMap((id) =>
+      pendingTurnsForTask(file, id)
+        .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user')
+        .map((turn) => turn.id),
+    );
+    const remoteLiveTurnIds = new Set(
+      liveTurnIds.filter(
+        (turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId),
+      ),
+    );
+    for (const turnId of liveTurnIds) {
+      if (!remoteLiveTurnIds.has(turnId)) {
+        this.liveRuns.get(turnId)?.abort();
+      }
+    }
+
+    const commit = this.store.commit((draft) => {
+      for (const id of taskIds) {
+        const task = draft.tasks[id];
+        if (!task || isTerminalLifecycle(task.lifecycle)) {
+          continue;
+        }
+        const pendingTurns = pendingTurnsForTask(draft, id);
+        const currentLive = pendingTurns.find(
+          (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+        );
+        if (currentLive && remoteLiveTurnIds.has(currentLive.id)) {
+          draft.cancelRequests = draft.cancelRequests ?? {};
+          // interrupt: task is sealed to skipped here; remote only settles the turn.
+          draft.cancelRequests[currentLive.id] = {
+            kind: 'interrupt',
+            by: 'engine',
+            opId: `skip-task-${taskId}`,
+            at: now,
+          };
+        }
+        const result = transitionSetTaskLifecycle(task, 'skipped', {
+          now,
+          sealedBy: 'user',
+        });
+        if (!result.ok) {
+          return result;
+        }
+        draft.tasks[id] = result.next;
+        for (const pending of pendingTurns) {
+          if (currentLive && remoteLiveTurnIds.has(currentLive.id) && pending.id === currentLive.id) {
+            continue;
+          }
+          if (pending.status === 'queued') {
+            const cancelled = cancelPendingTurn(pending, { now });
+            if (!cancelled.ok) return cancelled;
+            draft.turns[pending.id] = cancelled.next;
+          } else {
+            const interrupted = interruptTurn(pending, { now });
+            if (!interrupted.ok) return interrupted;
+            draft.turns[pending.id] = interrupted.next;
+          }
+        }
+      }
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    for (const turnId of liveTurnIds) {
+      if (remoteLiveTurnIds.has(turnId)) {
+        continue;
+      }
+      this.acceptedOpIds.delete(turnId);
+      this.askBridge.cancelForTurn(turnId, 'task skipped');
+      this.credentialRegistry?.revoke(turnId);
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /**
+   * Cancel task + descendants (user or authorized coordinator). Not driven by CLI exit.
+   */
   cancelTask(taskId: string): EngineResult<void> {
     const now = nowIso(this.clock);
     const file = this.store.getFile();
@@ -830,7 +1173,9 @@ export class TaskEngine {
         .map((turn) => turn.id),
     );
     const remoteLiveTurnIds = new Set(
-      liveTurnIds.filter((turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId)),
+      liveTurnIds.filter(
+        (turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId),
+      ),
     );
     for (const turnId of liveTurnIds) {
       if (!remoteLiveTurnIds.has(turnId)) {
@@ -940,42 +1285,41 @@ export class TaskEngine {
     const deps = this.graphDeps();
     const now = nowIso(this.clock);
     const nowMs = Date.parse(now);
+    if (!Number.isFinite(nowMs)) return;
     for (const task of Object.values(this.store.getFile().tasks)) {
       if (isTerminalLifecycle(task.lifecycle)) continue;
       const turns = this.store.getTurnsForTask(task.id);
       const firstStarted = turns.find((t) => t.startedAt)?.startedAt;
       if (!firstStarted) continue;
-      if (nowMs - Date.parse(firstStarted) <= task.executionPolicy.taskTimeoutMs) continue;
+      const startedMs = Date.parse(firstStarted);
+      // Invalid timestamps must not force-cancel every open task (NaN comparisons are false).
+      if (!Number.isFinite(startedMs)) continue;
+      if (nowMs - startedMs <= task.executionPolicy.taskTimeoutMs) continue;
+      // Timeout interrupts live turns only — does NOT seal task lifecycle (user/coordinator only).
       const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
       const remoteLeased =
-        live &&
-        deps.leaseOwnerAlive(live.id) &&
-        !deps.ownsLease(live.id);
+        live && deps.leaseOwnerAlive(live.id) && !deps.ownsLease(live.id);
       if (remoteLeased) {
-        deps.writeCancelRequest(live.id, 'cancel', 'engine', `task-timeout-${task.id}`);
+        deps.writeCancelRequest(live.id, 'interrupt', 'engine', `task-timeout-${task.id}`);
         continue;
       }
       if (live) this.liveRuns.get(live.id)?.abort();
       this.store.commit((draft) => {
-        const draftTask = draft.tasks[task.id];
-        if (!draftTask || isTerminalLifecycle(draftTask.lifecycle)) return { ok: true };
         const pendingTurns = Object.values(draft.turns).filter(
           (t) =>
             t.taskId === task.id &&
             (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
         );
-        const draftLive = pendingTurns.find(
-          (t) => t.status === 'running' || t.status === 'waiting_user',
-        );
-        const cancelled = transitionCancelTask(draftTask, { liveTurn: draftLive, now });
-        if (!cancelled.ok) return cancelled;
-        draft.tasks[task.id] = cancelled.next.task;
-        if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
         for (const pending of pendingTurns) {
-          if (pending.status !== 'queued' || pending.id === draftLive?.id) continue;
-          const settled = cancelPendingTurn(pending, { now });
-          if (settled.ok) draft.turns[pending.id] = settled.next;
+          if (pending.status === 'queued') {
+            const settled = cancelPendingTurn(pending, { now });
+            if (settled.ok) draft.turns[pending.id] = settled.next;
+          } else {
+            const interrupted = interruptTurn(pending, { now });
+            if (interrupted.ok) draft.turns[pending.id] = interrupted.next;
+          }
         }
+        // Task lifecycle stays open for user recovery / decision.
         return { ok: true };
       });
     }
@@ -1036,6 +1380,11 @@ export class TaskEngine {
     }
   }
 
+  /**
+   * Host policy for dependency `onUnsatisfied: fail|skip` — not CLI-driven.
+   * Seals dependents when a required dependency finished unsuccessfully.
+   * `onUnsatisfied: block` remains open + blocked via scheduler only.
+   */
   private applyDependencyTerminals(): void {
     const now = nowIso(this.clock);
     this.store.commit((draft) => {
@@ -1044,7 +1393,9 @@ export class TaskEngine {
         const outcome = dependencyTerminalOutcome(draft, task.id);
         if (!outcome) continue;
         const live = Object.values(draft.turns).find(
-          (t) => t.taskId === task.id && (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+          (t) =>
+            t.taskId === task.id &&
+            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
         );
         const terminal = applyDependencyTerminal(task, live, outcome, {
           now,
@@ -1148,7 +1499,12 @@ export class TaskEngine {
   }
 
   private async executeTurn(turnId: string): Promise<void> {
-    const lease = tryAcquireLease(this.storePath, turnId);
+    // Acquire the per-turn lease UNDER the cross-process store lock so lease
+    // read/reclaim/publish is serialized across VS Code windows. This eliminates the
+    // multi-process reclaim race (two engines reclaiming the same stale lease and both
+    // running one turn) that no plain-fs primitive can close on its own — only one
+    // process can be inside this critical section at a time.
+    const lease = this.store.runExclusive(() => tryAcquireLease(this.storePath, turnId));
     if (!lease) {
       return;
     }
@@ -1275,8 +1631,21 @@ export class TaskEngine {
             prompt,
             resumeId: task.committedSessionId,
             signal: abort.signal,
+            // Run the agent in the task's workspace directory so ACP adapters
+            // pass it as session/new|load { cwd } instead of falling back to
+            // process.cwd() (wrong dir in a packaged extension).
+            cwd: task.cwd,
+            model: task.model,
           })
-        : { options: { prompt, resumeId: task.committedSessionId, signal: abort.signal } };
+        : {
+            options: {
+              prompt,
+              resumeId: task.committedSessionId,
+              signal: abort.signal,
+              cwd: task.cwd,
+              model: task.model,
+            },
+          };
       mcpConfigPath = built.mcpConfigPath;
 
       for await (const event of this.runTurnFn(backend, built.options)) {

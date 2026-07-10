@@ -50,10 +50,18 @@ export type RetentionSettingsHostMessage =
 
 const properties = packageJson.contributes.configuration.properties;
 
-type RetentionConfigPropertyName = keyof typeof properties;
+/** Shape of a `muster.retention.*` package.json configuration property. Cast at
+ * the read site below because `properties` also holds non-retention entries
+ * (e.g. `muster.permissions.mode`, an enum/string property) whose union would
+ * otherwise widen `default`/`minimum` to types retention settings never use. */
+interface RetentionConfigProperty {
+  readonly default: number;
+  readonly minimum: number;
+  readonly description: string;
+}
 
-function packageProperty(settingId: RetentionSettingId): (typeof properties)[RetentionConfigPropertyName] {
-  return properties[`muster.retention.${settingId}` as RetentionConfigPropertyName];
+function packageProperty(settingId: RetentionSettingId): RetentionConfigProperty {
+  return properties[`muster.retention.${settingId}` as keyof typeof properties] as unknown as RetentionConfigProperty;
 }
 
 export const RETENTION_SETTING_DEFINITIONS: RetentionSettingDefinition[] = [

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
+// protocol.ts transitively imports ./vscode, whose module body calls
+// acquireVsCodeApi() (a webview-only global) at import time. Stub the module so
+// the pure helpers under test can be imported in the node test environment.
+// vi.mock is hoisted above the imports below, so it applies before protocol.ts
+// (and thus ./vscode) is evaluated.
 vi.mock('./vscode', () => ({
   vscode: {
     postMessage: vi.fn(),
@@ -8,10 +13,67 @@ vi.mock('./vscode', () => ({
   },
 }));
 
-import { isExtMessage, post, type OutMessage, type RetentionSettingSnapshot } from './protocol';
+import {
+  PROTOCOL_VERSION,
+  isExtMessage,
+  isProtocolCompatible,
+  post,
+  type OutMessage,
+  type RetentionSettingSnapshot,
+} from './protocol';
 import { vscode } from './vscode';
 
-const snapshot: RetentionSettingSnapshot = {
+describe('PROTOCOL_VERSION', () => {
+  it('is exported as a finite integer (single source of truth)', () => {
+    expect(typeof PROTOCOL_VERSION).toBe('number');
+    expect(Number.isInteger(PROTOCOL_VERSION)).toBe(true);
+  });
+});
+
+describe('isProtocolCompatible', () => {
+  it('treats the same version as compatible', () => {
+    expect(isProtocolCompatible(PROTOCOL_VERSION)).toBe(true);
+  });
+
+  it('treats a newer peer version as incompatible', () => {
+    expect(isProtocolCompatible(PROTOCOL_VERSION + 1)).toBe(false);
+  });
+
+  it('treats an older peer version as incompatible', () => {
+    expect(isProtocolCompatible(PROTOCOL_VERSION - 1)).toBe(false);
+  });
+
+  it('treats an absent version (old peer predating stamping) as incompatible', () => {
+    expect(isProtocolCompatible(undefined)).toBe(false);
+    expect(isProtocolCompatible(null)).toBe(false);
+  });
+
+  it('treats a non-numeric version as incompatible', () => {
+    expect(isProtocolCompatible(String(PROTOCOL_VERSION))).toBe(false);
+    expect(isProtocolCompatible({})).toBe(false);
+    expect(isProtocolCompatible(NaN)).toBe(false);
+  });
+});
+
+describe('isExtMessage snapshot version tolerance', () => {
+  const baseSnapshot = { type: 'snapshot', rootTasks: [], storeRevision: 0 };
+
+  it('accepts a snapshot stamped with the current protocolVersion', () => {
+    expect(isExtMessage({ ...baseSnapshot, protocolVersion: PROTOCOL_VERSION })).toBe(true);
+  });
+
+  it('accepts a snapshot without a protocolVersion (backward-tolerant shape)', () => {
+    // The compatibility decision lives in isProtocolCompatible; the shape guard
+    // itself stays tolerant so an unstamped snapshot is still recognized as one.
+    expect(isExtMessage(baseSnapshot)).toBe(true);
+  });
+
+  it('rejects a snapshot whose protocolVersion is not a number', () => {
+    expect(isExtMessage({ ...baseSnapshot, protocolVersion: 'nope' })).toBe(false);
+  });
+});
+
+const settingsSnapshot: RetentionSettingSnapshot = {
   settings: [
     {
       id: 'maxTurnsPerTask',
@@ -34,23 +96,26 @@ const snapshot: RetentionSettingSnapshot = {
 
 describe('settings protocol guard', () => {
   it('accepts a valid retention settings snapshot from the host', () => {
-    expect(isExtMessage({ type: 'settingsSnapshot', snapshot })).toBe(true);
+    expect(isExtMessage({ type: 'settingsSnapshot', snapshot: settingsSnapshot })).toBe(true);
   });
 
   it('rejects malformed settings snapshots from the host', () => {
     const malformedMessages = [
       { type: 'settingsSnapshot' },
       { type: 'settingsSnapshot', snapshot: { settings: 'not-array' } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], id: 'unsupported' }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], value: '200' }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], value: Number.NaN }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], value: 1.5 }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], value: 0 }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], minimum: Number.POSITIVE_INFINITY }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], minimum: 0 }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [{ ...snapshot.settings[0], label: 42 }] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [snapshot.settings[0]] } },
-      { type: 'settingsSnapshot', snapshot: { settings: [snapshot.settings[0], snapshot.settings[0]] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], id: 'unsupported' }] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], value: '200' }] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], value: Number.NaN }] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], value: 1.5 }] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], value: 0 }] } },
+      {
+        type: 'settingsSnapshot',
+        snapshot: { settings: [{ ...settingsSnapshot.settings[0], minimum: Number.POSITIVE_INFINITY }] },
+      },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], minimum: 0 }] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [{ ...settingsSnapshot.settings[0], label: 42 }] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [settingsSnapshot.settings[0]] } },
+      { type: 'settingsSnapshot', snapshot: { settings: [settingsSnapshot.settings[0], settingsSnapshot.settings[0]] } },
     ];
 
     for (const message of malformedMessages) {
@@ -108,13 +173,21 @@ describe('settings protocol guard', () => {
 
   it('rejects unsupported settings payload shapes and unrelated message types', () => {
     const unsupportedMessages = [
-      { type: 'settingsSnapshot', snapshot, extra: 'ignored?' },
-      { type: 'settingsUpdateResult', result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 }, extra: 'ignored?' },
-      { type: 'settingsUpdateResult', result: { ok: false, code: 'unknownSetting', message: 'Unsupported retention setting.' }, extra: 'ignored?' },
+      { type: 'settingsSnapshot', snapshot: settingsSnapshot, extra: 'ignored?' },
+      {
+        type: 'settingsUpdateResult',
+        result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 },
+        extra: 'ignored?',
+      },
+      {
+        type: 'settingsUpdateResult',
+        result: { ok: false, code: 'unknownSetting', message: 'Unsupported retention setting.' },
+        extra: 'ignored?',
+      },
       { type: 'settingsUpdated', settingId: 'maxTurnsPerTask', value: 50 },
       { type: 'settingsError', settingId: 'maxTurnsPerTask', message: 'Host rejected update.' },
-      { type: 'settingsSnapshot', snapshot, result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 } },
-      { type: 'unrelatedSettingsMessage', snapshot },
+      { type: 'settingsSnapshot', snapshot: settingsSnapshot, result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 } },
+      { type: 'unrelatedSettingsMessage', snapshot: settingsSnapshot },
     ];
 
     for (const message of unsupportedMessages) {
