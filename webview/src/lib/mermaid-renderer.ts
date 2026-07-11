@@ -17,7 +17,6 @@ function initialize(): void {
     securityLevel: 'strict',
     htmlLabels: false,
     flowchart: { htmlLabels: false },
-    security: { level: 'strict' },
   });
   initialized = true;
 }

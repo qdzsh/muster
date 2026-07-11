@@ -30,7 +30,11 @@ describe('strict Mermaid renderer', () => {
   });
 
   it('returns reason-coded readable fallbacks for bounds and renderer failures', async () => {
-    expect((await renderMermaidDiagram({ id: 'x', source: 'a', reason: 'oversized' })).reason).toBe('oversized');
+    expect(await renderMermaidDiagram({ id: 'x', source: 'a', reason: 'oversized' })).toEqual({
+      state: 'fallback',
+      reason: 'oversized',
+      source: 'a',
+    });
     render.mockRejectedValueOnce(new Error('parse detail with hostile source'));
     const failed = await renderMermaidDiagram({ id: 'y', source: '<script>x</script>' });
     expect(failed).toEqual({ state: 'fallback', reason: 'malformed', source: '<script>x</script>' });
