@@ -325,7 +325,7 @@ body {
 }
 
 .composer-shell--dragging::after {
-  content: 'Drop file to mention it';
+  content: '';
   position: absolute;
   inset: 4px;
   display: flex;
@@ -336,6 +336,14 @@ body {
   background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
   pointer-events: none;
   font-size: 12px;
+}
+
+.composer-drop-status {
+  position: relative;
+  z-index: 1;
+  color: var(--vscode-foreground);
+  font-weight: 600;
+  text-align: center;
 }
 
 .composer-guidance {

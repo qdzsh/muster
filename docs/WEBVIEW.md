@@ -569,7 +569,27 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ---
 
-## 12. Read-only presentation review and revision
+## 12. Workspace file-drop mentions
+
+Dragging onto an enabled composer is a request to insert a **textual mention**; it is not an attachment and does not upload or persist file contents. The webview extracts bounded drag candidates and sends `resolveFileDrop` with `{ candidates: string[] }` to the extension host. The host alone parses URIs, checks the workspace boundary, verifies the target, and replies with `filePicked` carrying `{ path: string }` only after resolution succeeds.
+
+The supported contract is deliberately narrow:
+
+- exactly one regular file from the current workspace; local `file:` and matching `vscode-remote:` workspace resources are accepted;
+- the returned path is workspace-relative, uses forward slashes, and contains no absolute workspace identity;
+- the composer inserts `@path` (or `@"path with spaces"`) at the current selection/caret, preserving surrounding draft text and placing the caret after the mention;
+- disabled composers ignore drag input and send no resolution request; and
+- multiple files, malformed or oversized data, unsupported schemes, missing workspaces, outside-workspace paths, directories, and stat failures are rejected with a bounded, sanitized user-facing error. Rejection does not change the draft and never reflects raw paths or filesystem errors.
+
+This is a security boundary, not merely formatting: the webview cannot declare a candidate safe, and `filePicked` must contain only the host-validated relative mention. The protocol does not grant the backend direct file bytes or create an attachment.
+
+### Proof boundary
+
+Unit tests cover extraction, host resolution, protocol guards, and negative cases. Focused Playwright covers the browser-visible composer flow with synthetic host messages. Local unit and Playwright checks are supportive only: only direct observation in an actual VS Code Extension Development Host can establish a live `PASS` or `FAIL`. Record live attempts and scenario-local environmental blockers using the contributor procedure and tracked evidence ledger.
+
+---
+
+## 13. Read-only presentation review and revision
 
 A coordinator-triggered dedicated tab presents a bounded review artifact beside the Muster chat. It is **read-only**: it is not an editor, file manager, or alternate conversation surface. Markdown paragraphs, tables, fenced code, and safe links render in the tab; links use the host's safe external-opening policy.
 
@@ -600,7 +620,7 @@ Contributor proof and live-host evidence rules are in [CONTRIBUTING.md](../CONTR
 
 ---
 
-## 13. References
+## 14. References
 
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [VS Code Elements docs](https://vscode-elements.github.io)

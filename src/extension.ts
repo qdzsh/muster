@@ -23,6 +23,7 @@ import {
 } from './host/retention-settings';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
+import { resolveDroppedFileMention } from './host/file-mentions';
 import { PresentationManager } from './host/presentation-manager';
 import {
   createPresentationPanelFactory,
@@ -355,26 +356,19 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private handleResolveFileDrop(candidates: unknown): void {
-    if (!Array.isArray(candidates)) {
-      this.postCommandError('file drop did not include a valid file reference');
-      return;
+  private async handleResolveFileDrop(candidates: unknown): Promise<void> {
+    const result = await resolveDroppedFileMention(candidates, {
+      workspaceFolders: vscode.workspace.workspaceFolders,
+      parseUri: (value) => vscode.Uri.parse(value, true),
+      fileUri: (value) => vscode.Uri.file(value),
+      joinPath: (base, value) => vscode.Uri.joinPath(base as vscode.Uri, value),
+      stat: (uri) => vscode.workspace.fs.stat(uri as vscode.Uri),
+    });
+    if (result.ok) {
+      this.post({ type: 'filePicked', path: result.path });
+    } else {
+      this.postCommandError(result.message);
     }
-
-    for (const value of candidates) {
-      if (typeof value !== 'string') continue;
-      for (const candidate of value.split(/\r?\n/)) {
-        const uri = this.uriFromDroppedCandidate(candidate);
-        if (!uri) continue;
-        const mentionPath = this.workspaceMentionForUri(uri);
-        if (mentionPath) {
-          this.post({ type: 'filePicked', path: mentionPath });
-          return;
-        }
-      }
-    }
-
-    this.postCommandError('Drop a file from the current workspace to mention it in chat.');
   }
 
   /**
@@ -1125,7 +1119,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           await this.handleBrowseWorkspaceFiles();
           break;
         case 'resolveFileDrop':
-          this.handleResolveFileDrop(data.candidates);
+          await this.handleResolveFileDrop(data.candidates);
           break;
         case 'openLink':
           this.handleOpenLink(data.url);

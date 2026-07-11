@@ -110,6 +110,8 @@
     "test:presentation-integration": "vitest run src/task/presentation-tool-auth.test.ts src/host/presentation-tool-router.test.ts src/host/presentation-manager.test.ts src/host/presentation-panel-adapter.test.ts src/host/presentation-chat-link.test.ts src/host/presentation-revision-loop.test.ts src/host/webview-security.test.ts && npm run compile && npm run test:webview -- e2e/muster-presentation.spec.ts",
     "test:presentation-live-evidence": "node --test scripts/verify-presentation-live-host-evidence.test.mjs",
     "test:presentation-docs": "node --test scripts/verify-presentation-docs.test.mjs",
+    "test:file-drop-live-evidence": "node --test scripts/verify-file-drop-live-host-evidence.test.mjs",
+    "test:file-drop-docs": "node --test scripts/verify-file-drop-docs.test.mjs",
     "test:watch": "vitest",
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
