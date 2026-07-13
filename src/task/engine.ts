@@ -1055,15 +1055,8 @@ export class TaskEngine {
       // Concurrent sends while a turn is live/queued still create queued turns
       // (scheduler promotes one-at-a-time). Refuse visibly when a turn cannot be
       // created — never leave free-floating pending messages without turn identity.
-      const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
-      // needs_recovery is only derived when no live/queued turn exists; free-form
-      // send must not invent a turn — use explicit recovery/retry paths instead.
-      if (viewStatus === 'needs_recovery') {
-        return {
-          ok: false,
-          reason: 'task needs recovery; resolve recovery before queueing a new turn',
-        };
-      }
+      // Phase B: free-form send after failed/interrupted is a normal continuation
+      // turn (not retryOf); needs_recovery no longer blocks admission.
 
       const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
       if (!turnCap.ok) {
@@ -2510,7 +2503,15 @@ export class TaskEngine {
                 this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
               }
             } else {
-              terminalSettled = await this.settleFailed(turnId, event.message, observedSessionId, rawOutput, backend);
+              const terminalReceived = event.meta?.failureClass === 'terminal_received';
+              terminalSettled = await this.settleFailed(
+                turnId,
+                event.message,
+                observedSessionId,
+                rawOutput,
+                backend,
+                { terminalReceived },
+              );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
               }
@@ -2717,6 +2718,7 @@ export class TaskEngine {
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
+    opts?: { terminalReceived?: boolean },
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
       return false;
@@ -2743,18 +2745,29 @@ export class TaskEngine {
           return result;
         }
 
+        const observed = observedSessionId ?? turn.observedSessionId;
         const candidate = selectCommittedSessionId(
           backend,
-          { observedSessionId: observedSessionId ?? turn.observedSessionId },
+          { observedSessionId: observed },
           rawOutput,
           undefined,
         );
         draft.turns[turnId] = {
           ...result.next.turn,
-          observedSessionId: observedSessionId ?? turn.observedSessionId,
+          observedSessionId: observed,
           candidateSessionId: candidate,
         };
-        draft.tasks[task.id] = result.next.task;
+        // Phase B: bind only terminal_received + nonblank observed session id
+        // (never speculative candidate from raw output).
+        let nextTask = result.next.task;
+        if (opts?.terminalReceived && !nextTask.committedSessionId) {
+          const bindId =
+            typeof observed === 'string' && observed.trim().length > 0 ? observed.trim() : undefined;
+          if (bindId) {
+            nextTask = { ...nextTask, committedSessionId: bindId };
+          }
+        }
+        draft.tasks[task.id] = nextTask;
         // Freeze pre-existing FIFO follow-ups before auto-retry is created so
         // the new retry turn is not holdAutoPromote-marked.
         holdQueuedFollowUpsOnFailure(draft, task.id);

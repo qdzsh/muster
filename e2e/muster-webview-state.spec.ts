@@ -19,6 +19,14 @@ type TaskViewStatus =
   | 'skipped'
   | 'open';
 
+type TurnActivity =
+  | { state: 'queued'; turnId: string; position?: number; waitReason?: string }
+  | { state: 'executing'; turnId: string; phase?: string }
+  | { state: 'waiting_you'; turnId: string; requestId?: string }
+  | { state: 'failed_turn'; turnId: string; retryable: boolean }
+  | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
+  | null;
+
 interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -27,6 +35,7 @@ interface TaskSummary {
   lifecycle: string;
   runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
+  currentTurnActivity: TurnActivity;
   updatedAt: string;
   backend: string;
 }
@@ -93,7 +102,7 @@ async function openWebview(page: Page) {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 
 async function postSnapshot(page: Page, snapshot: SnapshotMessage) {
   await page.evaluate((message) => {
@@ -147,6 +156,22 @@ async function expectButtonDisabledAttribute(page: Page, name: string) {
     .toBe(true);
 }
 
+function turnActivityFromView(viewStatus: TaskViewStatus, lifecycle: string): TurnActivity {
+  if (lifecycle !== 'open') return null;
+  switch (viewStatus) {
+    case 'running':
+      return { state: 'executing', turnId: 'turn-fixture' };
+    case 'waiting_user':
+      return { state: 'waiting_you', turnId: 'turn-fixture' };
+    case 'queued':
+      return { state: 'queued', turnId: 'turn-fixture', position: 1 };
+    case 'needs_recovery':
+      return { state: 'failed_turn', turnId: 'turn-fixture', retryable: true };
+    default:
+      return null;
+  }
+}
+
 function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
   const lifecycle = overrides.lifecycle ?? 'open';
   const viewStatus = overrides.viewStatus ?? (lifecycle === 'open' ? 'idle' : (lifecycle as TaskViewStatus));
@@ -162,20 +187,22 @@ function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
             ? 'idle'
             : viewStatus) as TaskRuntimeActivity)
         : null;
+  const currentTurnActivity =
+    overrides.currentTurnActivity !== undefined
+      ? overrides.currentTurnActivity
+      : turnActivityFromView(viewStatus, lifecycle);
   return {
     id: 'task-root',
     parentId: null,
     goal: 'Wire browser regression harness',
     role: 'coordinator',
-    lifecycle,
-    runtimeActivity,
-    viewStatus,
     updatedAt: '2026-01-01T00:00:00.000Z',
     backend: 'claude',
     ...overrides,
     lifecycle,
-    runtimeActivity: overrides.runtimeActivity !== undefined ? overrides.runtimeActivity : runtimeActivity,
-    viewStatus: overrides.viewStatus ?? viewStatus,
+    runtimeActivity,
+    viewStatus,
+    currentTurnActivity,
   };
 }
 

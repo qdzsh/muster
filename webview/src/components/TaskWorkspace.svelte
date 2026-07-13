@@ -108,7 +108,12 @@
       !!activeTurnId &&
       (runtime === 'queued' || runtime === 'waiting_dependencies'),
   );
-  const showRecovery = $derived(focused?.lifecycle === 'open' && runtime === 'needs_recovery');
+  const showFailedTurnCard = $derived(
+    !!focused &&
+      focused.lifecycle === 'open' &&
+      (focused.currentTurnActivity?.state === 'failed_turn' ||
+        (focused.currentTurnActivity === undefined && runtime === 'needs_recovery')),
+  );
   /** Sealed task: composer stays enabled; hint that send (or Reopen) restores open. */
   const showTerminalReopenHint = $derived(
     !!focused &&
@@ -118,12 +123,8 @@
         focused.lifecycle === 'skipped'),
   );
   const hasRetryableTurn = $derived(!!activeTurnId);
-  // Keep the composer editable during live/queued turns so Enter can create FIFO
-  // follow-ups and Ctrl+Enter can attempt honest live inject. Recovery and hard
-  // terminal / host read-only still lock free-form send.
-  const composerReadOnly = $derived(
-    !!focused && (thread.readOnly || showRecovery),
-  );
+  // Phase B: free-form send stays open after failed turns; only host readOnly locks.
+  const composerReadOnly = $derived(!!focused && thread.readOnly);
 
   function resumeQueued(): void {
     if (!focused || !activeTurnId) return;
@@ -386,19 +387,18 @@
       </div>
     {/if}
 
-    {#if showRecovery}
-      <div class="task-action-panel task-action-panel--danger">
-        <div class="font-semibold">Turn could not finish</div>
-        <p>{presentation.composerGuidance}</p>
+    {#if showFailedTurnCard}
+      <div class="task-action-panel task-action-panel--danger" data-turn-activity="failed_turn">
+        <div class="font-semibold">Could not finish</div>
         <p class="task-muted">
-          Task lifecycle remains <strong>Open</strong> — a failed turn is not a sealed task failure.
+          The last turn could not finish. Type a new message below to continue, or use Retry / Continue.
         </p>
         {#if !hasRetryableTurn}
           <p class="task-muted">No retryable turn is available for this task.</p>
         {/if}
 
         <div class="flex flex-col gap-1">
-          <span>Retry (required instruction)</span>
+          <span>Try again (optional instruction)</span>
           <vscode-textarea
             rows={2}
             placeholder="What should the agent do differently?"
@@ -408,12 +408,12 @@
             }}
           ></vscode-textarea>
           <vscode-button disabled={!retryInstruction.trim() || !activeTurnId} onclick={submitRetry}>
-            Retry failed turn
+            Try again
           </vscode-button>
         </div>
 
         <div class="flex flex-col gap-1">
-          <span>Continue (required message)</span>
+          <span>Check and continue</span>
           <vscode-textarea
             rows={2}
             placeholder="Message to queue as the next turn..."
@@ -423,7 +423,7 @@
             }}
           ></vscode-textarea>
           <vscode-button disabled={!continueMessage.trim() || !activeTurnId} onclick={submitContinue}>
-            Continue task
+            Continue
           </vscode-button>
         </div>
       </div>

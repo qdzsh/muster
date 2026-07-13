@@ -478,7 +478,7 @@ The webview never holds the whole thread. Render a **recent window**; older item
   host cascades descendants (`cancelTask` / `skipTask`). Distinct from interrupt
   turn. See `TASK-MANAGEMENT.md` §5.4–§5.6.
 - Legacy flat chat, `newSession`, and “Continue last” (`.muster-sessions.json`) were removed in Phase E.
-- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls; lifecycle stays `open`.
+- **`needs_recovery` / `failed_turn`**: inline “Could not finish” card with optional **Try again** / **Continue**; free-form composer remains open; lifecycle stays `open`.
 - **Reload-preserved queued turn**: **Resume** → `resumeQueuedTurn`.
 
 ### Webview persistence (host-owned transcript + lazy scrollback)
@@ -642,7 +642,7 @@ Task-workspace composer keyboard and queue UX (product contract for multi-turn f
 
 ### Composer unlock vs blocks
 
-The **composer stays editable** during `running` and `queued` so operators can stack follow-ups and interrupt & send. Free-form send is still blocked for recovery (`needs_recovery`), unresolved ask-user, and dependency gates that product policy marks non-writable. Terminal lifecycles (`succeeded` / `failed` / `cancelled` / `skipped`) stay writable: next `send` reopens the same task id to `open` and may queue a turn.
+The **composer stays editable** during `running`, `queued`, `needs_recovery`, and dependency/children/external waits so operators can stack follow-ups (scheduler gates promotion). Free-form send is UI-blocked only for structured `waiting_you` / pending ask (AskCard primary). Terminal lifecycles (`succeeded` / `failed` / `cancelled` / `skipped`) stay writable: next `send` reopens the same task id to `open` and may queue a turn.
 
 Guidance copy on the composer strip describes queue vs interrupt-and-send (e.g. “Enter queues a follow-up · Ctrl+Enter interrupts and sends”) rather than a hard disable-while-running message.
 

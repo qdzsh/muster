@@ -1566,6 +1566,173 @@ describe('TaskEngine.interruptAndSend', () => {
     expect(runOptions[1]?.prompt).toContain('queued then stop');
   });
 
+  it('accepts free-form send after needs_recovery as a continuation turn', async () => {
+    const { store } = makeTempStore();
+    store.commit((draft) => {
+      draft.tasks['recover-send'] = {
+        id: 'recover-send',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'recover via free-form',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: {
+          maxTurns: 20,
+          maxAutomaticRetries: 0,
+          turnTimeoutMs: 60_000,
+          taskTimeoutMs: 300_000,
+        },
+        revision: 0,
+        createdAt: '2026-07-06T00:00:00.000Z',
+        updatedAt: '2026-07-06T00:00:00.000Z',
+      };
+      draft.turns['failed-1'] = {
+        id: 'failed-1',
+        taskId: 'recover-send',
+        sequence: 1,
+        trigger: 'user',
+        status: 'failed',
+        inputs: [],
+        error: 'boom',
+        createdAt: '2026-07-06T00:00:00.000Z',
+        finishedAt: '2026-07-06T00:00:01.000Z',
+      };
+      return { ok: true };
+    });
+
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () =>
+        scriptedBackend([
+          { type: 'sessionStarted', sessionId: 'sess-cont' },
+          { type: 'turnCompleted' },
+        ]),
+      clock: () => '2026-07-06T00:00:02.000Z',
+    });
+
+    expect(engine.viewStatus('recover-send')).toBe('needs_recovery');
+    const sent = engine.send('recover-send', 'continue chatting');
+    expect(sent.ok).toBe(true);
+    if (!sent.ok || !sent.value.turnId) throw new Error('send failed');
+    const contTurn = store.getFile().turns[sent.value.turnId];
+    expect(contTurn?.retryOf).toBeUndefined();
+    expect(contTurn?.status === 'queued' || contTurn?.status === 'running' || contTurn?.status === 'succeeded').toBe(
+      true,
+    );
+    expect(store.getTask('recover-send')?.lifecycle).toBe('open');
+    await engine.whenIdle();
+    expect(store.getFile().turns[sent.value.turnId]?.status).toBe('succeeded');
+  });
+
+  it('queues send while waiting on children without promoting early', async () => {
+    const { store } = makeTempStore();
+    store.commit((draft) => {
+      draft.tasks['wait-children'] = {
+        id: 'wait-children',
+        role: 'coordinator',
+        lifecycle: 'open',
+        goal: 'parent wait',
+        parentId: null,
+        dependencies: [],
+        wait: { kind: 'children', taskIds: ['child-x'], registeredByTurnId: 'prev' },
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: {
+          maxTurns: 20,
+          maxAutomaticRetries: 0,
+          turnTimeoutMs: 60_000,
+          taskTimeoutMs: 300_000,
+        },
+        revision: 0,
+        createdAt: '2026-07-06T00:00:00.000Z',
+        updatedAt: '2026-07-06T00:00:00.000Z',
+      };
+      return { ok: true };
+    });
+
+    let ran = 0;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => {
+        ran += 1;
+        return scriptedBackend([{ type: 'turnCompleted' }]);
+      },
+      clock: () => '2026-07-06T00:00:02.000Z',
+    });
+
+    const sent = engine.send('wait-children', 'queue while waiting');
+    expect(sent.ok).toBe(true);
+    if (!sent.ok || !sent.value.turnId) throw new Error('send failed');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(store.getFile().turns[sent.value.turnId]?.status).toBe('queued');
+    expect(ran).toBe(0);
+  });
+
+  it('binds committedSessionId on first-turn terminal_received failure', async () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () =>
+        scriptedBackend([
+          { type: 'sessionStarted', sessionId: 'sess-term-1' },
+          {
+            type: 'error',
+            message: 'Agent stopped: max_tokens',
+            meta: { failureClass: 'terminal_received' },
+          },
+        ]),
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    const created = engine.createTask({
+      id: 'term-bind',
+      goal: 'bind on terminal fail',
+      backend: 'fake',
+      executionPolicy: {
+        maxTurns: 10,
+        maxAutomaticRetries: 0,
+        turnTimeoutMs: 60_000,
+        taskTimeoutMs: 300_000,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const sent = engine.send('term-bind', 'please fail terminally');
+    expect(sent.ok).toBe(true);
+    await engine.whenIdle();
+    expect(store.getTask('term-bind')?.committedSessionId).toBe('sess-term-1');
+    expect(store.getTask('term-bind')?.lifecycle).toBe('open');
+  });
+
+  it('does not bind committedSessionId on unclassified failure', async () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () =>
+        scriptedBackend([
+          { type: 'sessionStarted', sessionId: 'sess-unclass' },
+          { type: 'error', message: 'transport died' },
+        ]),
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    const created = engine.createTask({
+      id: 'unclass-bind',
+      goal: 'no bind',
+      backend: 'fake',
+      executionPolicy: {
+        maxTurns: 10,
+        maxAutomaticRetries: 0,
+        turnTimeoutMs: 60_000,
+        taskTimeoutMs: 300_000,
+      },
+    });
+    expect(created.ok).toBe(true);
+    const sent = engine.send('unclass-bind', 'please fail');
+    expect(sent.ok).toBe(true);
+    await engine.whenIdle();
+    expect(store.getTask('unclass-bind')?.committedSessionId).toBeUndefined();
+  });
+
   it('rapid double interruptAndSend reserves two FIFO turns and one interrupt', async () => {
     const { store, engine, taskId, turnId, resume, runOptions } = await startGatedTurn({
       eventsAfterSession: [

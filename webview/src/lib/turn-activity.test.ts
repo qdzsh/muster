@@ -73,14 +73,33 @@ describe('deriveTurnActivityState', () => {
 });
 
 describe('turnActivityFromTask', () => {
-  it('uses effective runtime from task', () => {
+  it('uses client derive only when currentTurnActivity key is absent (pre-host)', () => {
     expect(
       turnActivityFromTask({
         lifecycle: 'open',
         runtimeActivity: 'running',
         viewStatus: 'running',
-      }),
+      } as Parameters<typeof turnActivityFromTask>[0]),
     ).toBe('executing');
+  });
+
+  it('prefers host currentTurnActivity when present', () => {
+    expect(
+      turnActivityFromTask({
+        lifecycle: 'open',
+        runtimeActivity: 'needs_recovery',
+        viewStatus: 'needs_recovery',
+        currentTurnActivity: { state: 'failed_turn', turnId: 't1', retryable: true },
+      }),
+    ).toBe('failed_turn');
+    expect(
+      turnActivityFromTask({
+        lifecycle: 'open',
+        runtimeActivity: 'idle',
+        viewStatus: 'idle',
+        currentTurnActivity: null,
+      }),
+    ).toBe('null');
   });
 });
 

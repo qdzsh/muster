@@ -208,14 +208,28 @@ function terminalFromPrompt(result: PromptResult, cancelled: boolean, spec: AcpA
       meta: { interruptConfidence },
     };
   }
+  // Prompt returned a terminal result — Phase B session-bind evidence.
+  const terminalMeta = { failureClass: 'terminal_received' as const };
   if (typeof stopReason !== 'string' || stopReason.length === 0) {
-    return { type: 'error', message: `${spec.label} prompt ended without a stopReason` };
+    return {
+      type: 'error',
+      message: `${spec.label} prompt ended without a stopReason`,
+      meta: terminalMeta,
+    };
   }
   if (spec.failureStopReasons.has(stopReason)) {
-    return { type: 'error', message: `${spec.label} stopped: ${stopReason}` };
+    return {
+      type: 'error',
+      message: `${spec.label} stopped: ${stopReason}`,
+      meta: terminalMeta,
+    };
   }
   if (stopReason !== 'end_turn') {
-    return { type: 'error', message: `${spec.label} stopped: ${stopReason}`, meta: { stopReason } };
+    return {
+      type: 'error',
+      message: `${spec.label} stopped: ${stopReason}`,
+      meta: { ...terminalMeta, stopReason },
+    };
   }
   return { type: 'turnCompleted', meta: { stopReason } };
 }

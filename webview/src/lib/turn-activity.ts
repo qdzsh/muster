@@ -1,16 +1,16 @@
-import type { TaskRuntimeActivity, TaskSummary } from './protocol';
+import type { TaskRuntimeActivity, TaskSummary, TurnActivity } from './protocol';
 import { effectiveRuntimeActivity } from './protocol';
 import type { TaskStatusTone } from './task-status';
 
 /**
- * Phase A temporary client-side turn chrome (no CLI/process vocabulary).
- * Phase B replaces this with host-projected `currentTurnActivity`.
+ * Client presentation of host TurnActivity (or client fallback when host omits it).
  */
 export type TurnActivityState =
   | 'queued'
   | 'executing'
   | 'waiting_you'
   | 'failed_turn'
+  | 'uncertain'
   | 'null';
 
 export interface TurnActivityPresentation {
@@ -24,7 +24,10 @@ export interface TurnActivityPresentation {
   showStrip: boolean;
 }
 
-const PRESENTATIONS: Record<Exclude<TurnActivityState, 'null'>, Omit<TurnActivityPresentation, 'state' | 'showStrip'>> = {
+const PRESENTATIONS: Record<
+  Exclude<TurnActivityState, 'null'>,
+  Omit<TurnActivityPresentation, 'state' | 'showStrip'>
+> = {
   executing: {
     label: 'Working',
     hint: 'turn in progress',
@@ -53,9 +56,24 @@ const PRESENTATIONS: Record<Exclude<TurnActivityState, 'null'>, Omit<TurnActivit
     tone: 'danger',
     icon: 'warning',
   },
+  uncertain: {
+    label: 'Status unclear',
+    hint: 'continue or run again',
+    detail: 'Status is unclear — continue or run again?',
+    tone: 'warning',
+    icon: 'question',
+  },
 };
 
-/** Map open-task runtime (+ live stream flags) to turn activity chrome. */
+const WAIT_REASON_LABELS: Record<string, string> = {
+  dependencies: 'Waiting on dependencies',
+  children: 'Waiting on child tasks',
+  external: 'Waiting on external blocker',
+  held_after_failure: 'Paused after previous turn',
+  live_turn_ahead: 'Queued behind live turn',
+};
+
+/** Map open-task runtime (+ live stream flags) to turn activity chrome (client fallback). */
 export function deriveTurnActivityState(input: {
   lifecycle: string;
   runtimeActivity: TaskRuntimeActivity | null | undefined;
@@ -76,15 +94,46 @@ export function deriveTurnActivityState(input: {
   if (runtime === 'needs_recovery') {
     return 'failed_turn';
   }
-  // waiting_dependencies / waiting_children / blocked / awaiting_outcome / idle / terminal:
-  // no process strip — ready or orchestration elsewhere.
   return 'null';
 }
 
+export function turnActivityStateFromHost(activity: TurnActivity | undefined): TurnActivityState | undefined {
+  if (activity === undefined) return undefined;
+  if (activity === null) return 'null';
+  switch (activity.state) {
+    case 'executing':
+      return 'executing';
+    case 'waiting_you':
+      return 'waiting_you';
+    case 'queued':
+      return 'queued';
+    case 'failed_turn':
+      return 'failed_turn';
+    case 'uncertain':
+      return 'uncertain';
+    default:
+      return 'null';
+  }
+}
+
+/**
+ * Host-authoritative `currentTurnActivity` (protocol v3). Optional local
+ * askPending may only promote chrome to waiting_you while a card is open.
+ */
 export function turnActivityFromTask(
-  task: Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'>,
+  task: Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'> & {
+    currentTurnActivity?: TurnActivity;
+  },
   opts?: { threadRunning?: boolean; askPending?: boolean },
 ): TurnActivityState {
+  if ('currentTurnActivity' in task && task.currentTurnActivity !== undefined) {
+    const fromHost = turnActivityStateFromHost(task.currentTurnActivity) ?? 'null';
+    if (opts?.askPending && fromHost !== 'waiting_you') {
+      return 'waiting_you';
+    }
+    return fromHost;
+  }
+  // Draft / pre-host path only.
   return deriveTurnActivityState({
     lifecycle: task.lifecycle,
     runtimeActivity: effectiveRuntimeActivity(task),
@@ -93,7 +142,10 @@ export function turnActivityFromTask(
   });
 }
 
-export function getTurnActivityPresentation(state: TurnActivityState): TurnActivityPresentation {
+export function getTurnActivityPresentation(
+  state: TurnActivityState,
+  opts?: { waitReason?: string; hostActivity?: TurnActivity },
+): TurnActivityPresentation {
   if (state === 'null') {
     return {
       state: 'null',
@@ -105,5 +157,19 @@ export function getTurnActivityPresentation(state: TurnActivityState): TurnActiv
       showStrip: false,
     };
   }
-  return { state, showStrip: true, ...PRESENTATIONS[state] };
+  const base = { state, showStrip: true, ...PRESENTATIONS[state] };
+  if (state === 'queued') {
+    const reason =
+      opts?.waitReason ??
+      (opts?.hostActivity && opts.hostActivity.state === 'queued' ? opts.hostActivity.waitReason : undefined);
+    if (reason && WAIT_REASON_LABELS[reason]) {
+      return {
+        ...base,
+        label: WAIT_REASON_LABELS[reason],
+        hint: reason.replace(/_/g, ' '),
+        detail: WAIT_REASON_LABELS[reason],
+      };
+    }
+  }
+  return base;
 }

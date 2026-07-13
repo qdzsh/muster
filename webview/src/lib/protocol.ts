@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /**
  * Decide whether a peer's advertised protocol version is compatible with ours.
@@ -47,6 +47,28 @@ export type TaskRuntimeActivity =
  */
 export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 
+/** Host-owned turn chrome (mirrors src/host/snapshot.ts). */
+export type TurnActivityWaitReason =
+  | 'dependencies'
+  | 'children'
+  | 'external'
+  | 'held_after_failure'
+  | 'live_turn_ahead'
+  | string;
+
+export type TurnActivity =
+  | {
+      state: 'queued';
+      turnId: string;
+      position?: number;
+      waitReason?: TurnActivityWaitReason;
+    }
+  | { state: 'executing'; turnId: string; phase?: 'starting' | 'streaming' | 'tool' | 'retrying' }
+  | { state: 'waiting_you'; turnId: string; requestId?: string }
+  | { state: 'failed_turn'; turnId: string; retryable: boolean }
+  | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
+  | null;
+
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -56,8 +78,8 @@ export interface TaskSummary {
   /** Present when host supports dual-axis status; null when lifecycle is terminal. */
   runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
-  /** Backend session bound to this task for resume across process restarts. */
-  committedSessionId?: string;
+  /** Host-authoritative turn activity for composer/list chrome (required protocol v3+). */
+  currentTurnActivity: TurnActivity;
   /** Agent proposed complete/fail while lifecycle remains open. */
   hasOutcomeProposal?: boolean;
   updatedAt: string;
@@ -417,6 +439,34 @@ function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
   return isRetentionSettingId(v.settingId);
 }
 
+function isTurnActivity(v: unknown): v is TurnActivity {
+  if (v === null) return true;
+  if (!isRecord(v) || !isString(v.state) || !isString(v.turnId)) return false;
+  switch (v.state) {
+    case 'queued':
+      return (
+        (v.position === undefined || isNumber(v.position)) &&
+        (v.waitReason === undefined || isString(v.waitReason))
+      );
+    case 'executing':
+      return (
+        v.phase === undefined ||
+        v.phase === 'starting' ||
+        v.phase === 'streaming' ||
+        v.phase === 'tool' ||
+        v.phase === 'retrying'
+      );
+    case 'waiting_you':
+      return v.requestId === undefined || isString(v.requestId);
+    case 'failed_turn':
+      return typeof v.retryable === 'boolean';
+    case 'uncertain':
+      return v.requiresConfirmation === true;
+    default:
+      return false;
+  }
+}
+
 function isTaskSummary(v: unknown): v is TaskSummary {
   if (!isRecord(v)) return false;
   return (
@@ -426,6 +476,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     isString(v.role) &&
     isString(v.lifecycle) &&
     isString(v.viewStatus) &&
+    isTurnActivity(v.currentTurnActivity) &&
     isString(v.updatedAt) &&
     isString(v.backend) &&
     (v.model === undefined || isString(v.model))

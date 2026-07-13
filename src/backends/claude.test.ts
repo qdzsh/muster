@@ -308,19 +308,19 @@ describe('ClaudeBackend.run — terminal classification', () => {
 
   it('missing stopReason -> "prompt ended without a stopReason" error', async () => {
     const events = await runTurn(new ClaudeBackend(), options(), fake, { result: {} });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Claude prompt ended without a stopReason' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Claude prompt ended without a stopReason', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a failure stopReason -> "stopped" error WITHOUT meta', async () => {
     const events = await runTurn(new ClaudeBackend(), options(), fake, { result: { stopReason: 'max_tokens' } });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Claude stopped: max_tokens' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Claude stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
   it('max_turn_requests is a failure stopReason for Claude -> error WITHOUT meta', async () => {
     const events = await runTurn(new ClaudeBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },
     });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Claude stopped: max_turn_requests' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Claude stopped: max_turn_requests', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a non-failure non-end_turn stopReason -> "stopped" error WITH meta', async () => {
@@ -328,7 +328,7 @@ describe('ClaudeBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({
       type: 'error',
       message: 'Claude stopped: surprise',
-      meta: { stopReason: 'surprise' },
+      meta: { failureClass: 'terminal_received', stopReason: 'surprise' },
     });
   });
 });

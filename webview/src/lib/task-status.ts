@@ -397,21 +397,13 @@ export function taskStatusLabel(status: TaskViewStatus | string | null | undefin
 }
 
 /**
- * Runtime activities that block free-form composer send.
+ * Runtime activities that block free-form composer send (UI default only).
  *
- * Live turns (`running`) and FIFO `queued` states stay open so Enter can create
- * follow-ups and Ctrl+Enter can attempt live inject. Recovery, ask-user, and
- * dependency gates still block free-form send.
+ * Phase B: free-form send is accepted for needs_recovery and wait orchestration
+ * (deps/children/external). Only structured `waiting_user` / pending ask blocks
+ * Enter by default (AskCard is primary).
  */
 export function runtimeBlocksComposer(activity: TaskRuntimeActivity | null | undefined): boolean {
   if (!activity) return false;
-  // awaiting_outcome: agent proposed complete but task stays open — user may still
-  // send a message (clears proposal and continues session). Do not block.
-  // running / queued: unlocked for FIFO follow-ups + honest live-input path.
-  return (
-    activity === 'waiting_dependencies' ||
-    activity === 'waiting_children' ||
-    activity === 'waiting_user' ||
-    activity === 'needs_recovery'
-  );
+  return activity === 'waiting_user';
 }

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   activeTurnIdForTask,
   buildSnapshot,
+  projectCurrentTurnActivity,
   projectQueuedTurns,
+  projectTaskSummary,
   type PendingAskOverlay,
 } from './snapshot';
 import type { TaskStore } from '../task/store';
@@ -409,6 +411,156 @@ describe('host task snapshot projection', () => {
     expect(activeTurnIdForTask(file, 'recovering')).toBe('interrupted');
     expect(activeTurnIdForTask(file, 'settled')).toBeUndefined();
     expect(activeTurnIdForTask(file, 'missing')).toBeUndefined();
+  });
+
+  it('projects currentTurnActivity per host precedence including pure stop → null', () => {
+    const runningFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {
+        live: turn({ id: 'live', taskId: 't', status: 'running', sequence: 1 }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(runningFile, 't')).toEqual({
+      state: 'executing',
+      turnId: 'live',
+    });
+    expect(projectTaskSummary(runningFile, 't')?.currentTurnActivity).toEqual({
+      state: 'executing',
+      turnId: 'live',
+    });
+    expect(projectTaskSummary(runningFile, 't')).not.toHaveProperty('committedSessionId');
+
+    const waitingFile: TaskStoreFile = {
+      ...runningFile,
+      turns: {
+        live: turn({ id: 'ask', taskId: 't', status: 'waiting_user', sequence: 1 }),
+      },
+    };
+    expect(projectCurrentTurnActivity(waitingFile, 't')).toEqual({
+      state: 'waiting_you',
+      turnId: 'ask',
+    });
+
+    const depFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        t: task('t', {
+          dependencies: [
+            { taskId: 'dep', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+          ],
+        }),
+        dep: task('dep', { lifecycle: 'open' }),
+      },
+      turns: {
+        q: turn({ id: 'q', taskId: 't', status: 'queued', sequence: 1 }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(depFile, 't')).toEqual({
+      state: 'queued',
+      turnId: 'q',
+      position: 1,
+      waitReason: 'dependencies',
+    });
+
+    const childrenFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        t: task('t', { wait: { kind: 'children', taskIds: ['c1'], registeredByTurnId: 'prev' } }),
+      },
+      turns: {
+        q: turn({ id: 'q', taskId: 't', status: 'queued', sequence: 1 }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(childrenFile, 't')).toMatchObject({
+      state: 'queued',
+      waitReason: 'children',
+    });
+
+    const heldFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {
+        q: turn({
+          id: 'q',
+          taskId: 't',
+          status: 'queued',
+          sequence: 1,
+          holdAutoPromote: true,
+        }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(heldFile, 't')).toMatchObject({
+      state: 'queued',
+      waitReason: 'held_after_failure',
+    });
+
+    const failedFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {
+        f: turn({ id: 'f', taskId: 't', status: 'failed', sequence: 1, error: 'boom' }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(failedFile, 't')).toEqual({
+      state: 'failed_turn',
+      turnId: 'f',
+      retryable: true,
+    });
+
+    const successAfterFailFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {
+        f: turn({ id: 'f', taskId: 't', status: 'failed', sequence: 1, error: 'boom' }),
+        s: turn({ id: 's', taskId: 't', status: 'succeeded', sequence: 2 }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(successAfterFailFile, 't')).toBeNull();
+
+    const pureStopFile: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {
+        stop: turn({
+          id: 'stop',
+          taskId: 't',
+          status: 'interrupted',
+          sequence: 1,
+          isCancellation: true,
+          interruptConfidence: 'confirmed',
+        }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectCurrentTurnActivity(pureStopFile, 't')).toBeNull();
   });
 
   it('excludes queued-turn user messages from transcript but projects queue previewText', () => {

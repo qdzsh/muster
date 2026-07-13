@@ -264,19 +264,19 @@ describe('CodexBackend.run — terminal classification', () => {
 
   it('missing stopReason -> "prompt ended without a stopReason" error', async () => {
     const events = await runTurn(new CodexBackend(), options(), fake, { result: {} });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex prompt ended without a stopReason' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex prompt ended without a stopReason', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a failure stopReason -> "stopped" error WITHOUT meta', async () => {
     const events = await runTurn(new CodexBackend(), options(), fake, { result: { stopReason: 'max_tokens' } });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex stopped: max_tokens' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
   it('max_turn_requests is a failure stopReason for Codex -> error WITHOUT meta', async () => {
     const events = await runTurn(new CodexBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },
     });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex stopped: max_turn_requests' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex stopped: max_turn_requests', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a non-failure non-end_turn stopReason -> "stopped" error WITH meta', async () => {
@@ -284,7 +284,7 @@ describe('CodexBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({
       type: 'error',
       message: 'Codex stopped: surprise',
-      meta: { stopReason: 'surprise' },
+      meta: { failureClass: 'terminal_received', stopReason: 'surprise' },
     });
   });
 });

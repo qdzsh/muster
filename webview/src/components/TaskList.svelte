@@ -1,8 +1,7 @@
 <script lang="ts">
   import { tasks } from '../lib/tasks.svelte';
-  import { effectiveRuntimeActivity, post } from '../lib/protocol';
+  import { post, type TaskSummary } from '../lib/protocol';
   import { getLifecyclePresentation, isSoftTerminal } from '../lib/task-status';
-  import type { TaskSummary } from '../lib/protocol';
   import { backendModelLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
 
@@ -53,10 +52,10 @@
 
   function taskStateFlags(task: TaskSummary): string[] {
     const flags: string[] = [];
-    const runtime = effectiveRuntimeActivity(task);
+    const activity = task.currentTurnActivity?.state;
     flags.push(`Task ${getLifecyclePresentation(task.lifecycle).label}`);
-    if (runtime === 'running') flags.push('Turn working');
-    if (runtime === 'waiting_user') flags.push('Waiting for you');
+    if (activity === 'executing') flags.push('Turn working');
+    if (activity === 'waiting_you') flags.push('Waiting for you');
     if (isSoftTerminal(task.lifecycle)) flags.push('Soft failed — send to reopen');
     if (task.backend) flags.push(`Backend ${task.backend}`);
     if (task.continuationOf) flags.push('Continuation');
@@ -68,10 +67,10 @@
     return [shortGoal(task.goal), ...flags].join(' ');
   }
 
-  /** True when a turn is live (executing or waiting for the user). */
+  /** True when host turn activity is live (executing or waiting for the user). */
   function isTurnLive(task: TaskSummary): boolean {
-    const runtime = effectiveRuntimeActivity(task);
-    return runtime === 'running' || runtime === 'waiting_user';
+    const activity = task.currentTurnActivity?.state;
+    return activity === 'executing' || activity === 'waiting_you';
   }
 
   function startRename(task: TaskSummary) {

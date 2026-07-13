@@ -153,11 +153,12 @@ describe('task status dual-axis presentation', () => {
     expect(runtimeBlocksComposer('awaiting_outcome')).toBe(false);
   });
 
-  it('still blocks composer for recovery, ask-user, and dependency gates', () => {
+  it('blocks free-form composer only for waiting_user (Phase B)', () => {
     expect(runtimeBlocksComposer('waiting_user')).toBe(true);
-    expect(runtimeBlocksComposer('needs_recovery')).toBe(true);
-    expect(runtimeBlocksComposer('waiting_dependencies')).toBe(true);
-    expect(runtimeBlocksComposer('waiting_children')).toBe(true);
+    expect(runtimeBlocksComposer('needs_recovery')).toBe(false);
+    expect(runtimeBlocksComposer('waiting_dependencies')).toBe(false);
+    expect(runtimeBlocksComposer('waiting_children')).toBe(false);
+    expect(runtimeBlocksComposer('blocked')).toBe(false);
   });
 
   it('describes queue and live-inject affordances while a turn is running', () => {

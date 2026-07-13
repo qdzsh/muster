@@ -265,19 +265,19 @@ describe('OpenCodeBackend.run — terminal classification', () => {
 
   it('missing stopReason -> "prompt ended without a stopReason" error', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, { result: {} });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode prompt ended without a stopReason' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode prompt ended without a stopReason', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a failure stopReason -> "stopped" error WITHOUT meta', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, { result: { stopReason: 'max_tokens' } });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_tokens' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
   it('max_turn_requests is a failure stopReason for OpenCode -> error WITHOUT meta', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },
     });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_turn_requests' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_turn_requests', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a non-failure non-end_turn stopReason -> "stopped" error WITH meta', async () => {
@@ -285,7 +285,7 @@ describe('OpenCodeBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({
       type: 'error',
       message: 'OpenCode stopped: surprise',
-      meta: { stopReason: 'surprise' },
+      meta: { failureClass: 'terminal_received', stopReason: 'surprise' },
     });
   });
 });

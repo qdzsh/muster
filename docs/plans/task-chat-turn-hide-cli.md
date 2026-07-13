@@ -283,18 +283,18 @@ Pre-failure queued turns stay **held** (`holdAutoPromote`); UI: “Paused after 
 - tests: engine send-after-failure, send-while-deps/children, scheduler wait gate, snapshot projection + waitReason, webview gating, first-turn failure session bind, e2e
 
 **AC:**
-- [ ] Send after exhausted auto-retry is **accepted**; creates new turn; lifecycle stays `open`.
-- [ ] Composer open for `needs_recovery`, dependency wait, children wait, external wait; only structured ask default-blocks free-form Enter.
-- [ ] Send while deps/children/external wait → **accepted**, queued, `waitReason` set, **not** executed early (webview + engine tests).
-- [ ] No recovery panel / process vocabulary required to continue chatting.
-- [ ] Free-form during structured ask is not mistaken for answer (AskCard primary).
-- [ ] Reload-interrupted / orphan live turn does **not** auto-replay.
-- [ ] First-turn failure with **`terminal_received`** + observed session → next send loads same session (no silent fork).
-- [ ] Failure **without** terminal marker → no auto-bind; send still accepted.
-- [ ] Pure user Stop → activity `null`; no “Could not finish” / recovery chrome.
-- [ ] Webview does not read `committedSessionId` / `hadProcess` for product chrome.
-- [ ] Host projects `currentTurnActivity` per precedence; composer strip uses it only.
-- [ ] Protocol version bumped; `npm run compile` + reload verified for UAT path.
+- [x] Send after exhausted auto-retry is **accepted**; creates new turn; lifecycle stays `open`.
+- [x] Composer open for `needs_recovery`, dependency wait, children wait, external wait; only structured ask default-blocks free-form Enter.
+- [x] Send while deps/children/external wait → **accepted**, queued, `waitReason` set, **not** executed early (webview + engine tests).
+- [x] No recovery panel / process vocabulary required to continue chatting.
+- [x] Free-form during structured ask is not mistaken for answer (AskCard primary).
+- [x] Reload-interrupted / orphan live turn does **not** auto-replay.
+- [x] First-turn failure with **`terminal_received`** + observed session → next send loads same session (no silent fork).
+- [x] Failure **without** terminal marker → no auto-bind; send still accepted.
+- [x] Pure user Stop → activity `null`; no “Could not finish” / recovery chrome.
+- [x] Webview does not read `committedSessionId` / `hadProcess` for product chrome.
+- [x] Host projects `currentTurnActivity` per precedence; composer strip uses it only.
+- [x] Protocol version bumped; `npm run compile` + reload verified for UAT path.
 
 ---
 

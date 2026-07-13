@@ -428,11 +428,11 @@ not product chrome after Phase A of `docs/plans/task-chat-turn-hide-cli.md`.
 | **Task lifecycle** | Is the work open / done / failed / cancelled / skipped? | Task list badge + workspace header |
 | **Turn activity** | Is a turn working / waiting for you / queued / could not finish / ready? | Composer strip (`data-turn-activity`); optional turn-active list dot |
 | **Orchestration activity** | Waiting on deps, children, recovery, outcome proposal? | Secondary line / action panels — not the task badge |
-| **Process / session** (internal) | Agent process and `committedSessionId` | Engine-owned; **not** product chrome (may remain on wire until Phase B drops it) |
+| **Process / session** (internal) | Agent process and `committedSessionId` | Engine-owned; **not** product chrome; not on webview wire (Phase B+) |
 
 The store persists **lifecycle**, turns, dependencies, waits, and optional
-`outcomeProposal`. Turn activity and orchestration are **derived** (Phase A:
-webview-side map; Phase B: host-projected `currentTurnActivity`).
+`outcomeProposal`. Turn activity is **host-projected** as `currentTurnActivity`
+(Phase B); orchestration may still appear via `runtimeActivity`.
 
 #### 4.3.1 Task lifecycle (persisted work outcome)
 
@@ -891,7 +891,7 @@ both constrain behavior:
 | `open` | `running` | `send` queues a FIFO follow-up (no interrupt); **Ctrl+Enter** `sendLiveInput` → reserve follow-up then interrupt live turn (cut & continue). `submitAsk` remains the path for structured ask answers |
 | `open` | `waiting_user` | Answer the pending ask via `submitAsk`; free-form composer may still queue follow-ups when product policy allows |
 | `open` | `waiting_children` / `blocked` | Persist / queue for the next continuation turn |
-| `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery (free-form send blocked while recovery is required) |
+| `open` | `needs_recovery` | Persist; free-form send accepted as continuation; soft “Could not finish” card + optional Retry / Continue |
 | `open` | `awaiting_outcome` | Prefer Accept/Reject when an outcome card exists. **Composer stays writable:** a new `send` clears `outcomeProposal`, keeps lifecycle `open`, and queues a turn (continue session). Do **not** block send solely because a proposal is pending. |
 | `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
 | `succeeded` / `cancelled` / `skipped` | — | **Reopen** to `open` on the same task id, then queue a turn (same as soft-fail). Operators may still create a new task instead |
@@ -1111,14 +1111,13 @@ Preferred summary fields (additive):
 ```text
 lifecycle          TaskLifecycleState
 runtimeActivity    TaskRuntimeActivity      // orchestration + live turn signals
-currentTurnActivity?  // Phase B host-owned product chrome (see plan)
-// Do not project cliViewStatus / process phases as product chrome (Phase A+)
-// committedSessionId remains engine-owned; drop from wire in Phase B
+currentTurnActivity  // host-owned product chrome (TurnActivity | null)
+// Do not project cliViewStatus / process phases / committedSessionId as product chrome
 outcomeProposal?   OutcomeProposal
 ```
 
-Phase A: webview derives **turn activity** from `runtimeActivity` + live stream
-flags (no CLI process labels). Phase B: host projects `currentTurnActivity`.
+Host projects **turn activity** as `currentTurnActivity`. Webview prefers that
+field and falls back to client derive only if absent.
 
 The webview ignores late events whose `turnId` is no longer active for that task.
 `submitAsk` must include `taskId`, `turnId`, and `askId`.

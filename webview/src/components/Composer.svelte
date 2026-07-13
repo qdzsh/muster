@@ -81,7 +81,15 @@
     if (taskStatus === 'needs_recovery') return 'failed_turn';
     return 'null';
   });
-  const turnPresentation = $derived(getTurnActivityPresentation(turnActivity));
+  const turnPresentation = $derived(
+    getTurnActivityPresentation(turnActivity, {
+      hostActivity: task?.currentTurnActivity,
+      waitReason:
+        task?.currentTurnActivity && task.currentTurnActivity.state === 'queued'
+          ? task.currentTurnActivity.waitReason
+          : undefined,
+    }),
+  );
 
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
   let highlightEl = $state<HTMLDivElement | undefined>(undefined);
@@ -105,14 +113,11 @@
 
   // Terminal lifecycles stay writable: host send reopens the same task to open.
   // Live/queued stay writable so Enter queues FIFO follow-ups and Ctrl+Enter can inject.
+  // Phase B: only structured waiting_you / pendingAsk blocks free-form by default.
   const statusBlocksSend = $derived(
     task
-      ? runtimeBlocksComposer(runtime)
-      : // Legacy viewStatus path: keep running/queued unlocked (FIFO + live inject).
-        taskStatus === 'waiting_dependencies' ||
-          taskStatus === 'waiting_children' ||
-          taskStatus === 'waiting_user' ||
-          taskStatus === 'needs_recovery',
+      ? runtimeBlocksComposer(runtime) || turnActivity === 'waiting_you'
+      : taskStatus === 'waiting_user',
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
   // Draft still waits for the first turn to settle. Task mode stays open while
@@ -454,16 +459,15 @@
   /** Blocks send (busy/gated). Terminal reopenable is NOT a block. Live/queued are not blocks. */
   const blockReason = $derived.by(() => {
     if (mode === 'draft') return '';
-    if (pendingAsk) return 'Answer the pending task question above to continue.';
+    if (pendingAsk || turnActivity === 'waiting_you') {
+      return 'Answer above to continue.';
+    }
     if (task) {
       if (runtimeBlocksComposer(runtime)) return presentation.composerGuidance;
       if (readOnly) return 'This task is read-only right now.';
       return '';
     }
-    if (taskStatus === 'waiting_dependencies') return presentation.composerGuidance;
-    if (taskStatus === 'waiting_children') return presentation.composerGuidance;
-    if (taskStatus === 'waiting_user') return presentation.composerGuidance;
-    if (taskStatus === 'needs_recovery') return presentation.composerGuidance;
+    if (taskStatus === 'waiting_user') return 'Answer above to continue.';
     if (readOnly) return 'This task is read-only right now.';
     return '';
   });

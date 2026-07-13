@@ -133,6 +133,19 @@ export function canPromoteTurn(
     return { ok: false, reason: 'dependencies not satisfied' };
   }
 
+  // Open composer may accept sends while task.wait is active; do not promote early.
+  if (task.wait?.kind === 'children') {
+    return { ok: false, reason: 'waiting on child tasks' };
+  }
+  if (task.wait?.kind === 'external') {
+    return { ok: false, reason: 'waiting on external blocker' };
+  }
+
+  // Pre-failure FIFO holds require explicit resume (not auto-promote).
+  if (turn.holdAutoPromote) {
+    return { ok: false, reason: 'held after previous turn failure' };
+  }
+
   if (countRunningTurns(file) >= limits.maxConcurrentTurns) {
     return { ok: false, reason: 'global concurrency limit' };
   }
