@@ -24,7 +24,7 @@
     SettingsUpdateResult,
   } from './lib/protocol';
   import { tip } from './lib/tooltip';
-  import { outboxList, outboxRemove } from './lib/send-outbox';
+  import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
   import { vscode } from './lib/vscode';
 
   const SETTING_LABELS: Record<RetentionSettingId, string> = {
@@ -219,10 +219,10 @@
           } else if (tasks.draftMode) {
             threadStore.clearFocus();
           }
-          // Phase C: replay outbox only after a compatible host snapshot.
+          // Phase C: replay pending (not rejected) outbox only after compatible snapshot.
           if (!outboxReplayed && !protocolMismatch) {
             outboxReplayed = true;
-            for (const entry of outboxList(vscode)) {
+            for (const entry of outboxPending(vscode)) {
               post({
                 type: 'send',
                 taskId: entry.taskId,
@@ -427,26 +427,19 @@
           break;
 
         case 'sendRejected': {
-          const rejected = outboxList(vscode).find((e) => e.clientRequestId === msg.clientRequestId);
-          // Keep outbox entry until draft is restored into the originating composer.
-          // Composer only applies prefill when empty, so we re-attempt on focus changes.
-          if (rejected?.keepDraft && rejected.text) {
+          const rejected = outboxMarkRejected(vscode, msg.clientRequestId);
+          if (rejected?.text) {
             const sameScope =
               (!rejected.taskId && tasks.draftMode) ||
               (!!rejected.taskId && rejected.taskId === tasks.focusedTaskId);
             if (sameScope) {
               tasks.prefillComposer(rejected.text);
-              // Composer clears prefill when empty and applies it; remove only then.
-              // If composer was non-empty, leave outbox so user can still recover text
-              // via a later empty-composer focus or manual clear.
               queueMicrotask(() => {
-                // Best-effort: if prefill was consumed (composerPrefill cleared), drop outbox.
                 if (!tasks.composerPrefill) {
                   outboxRemove(vscode, msg.clientRequestId);
                 }
               });
             }
-            // Wrong scope: keep outbox entry for later when user focuses that task.
           } else {
             outboxRemove(vscode, msg.clientRequestId);
           }
@@ -488,23 +481,26 @@
 
   let outboxReplayed = false;
 
-  // After focus changes, try restoring any rejected drafts still held in outbox.
+  // After focus changes, restore only rejected drafts (never pending ACK entries).
   $effect(() => {
     void tasks.focusedTaskId;
     void tasks.draftMode;
-    for (const entry of outboxList(vscode)) {
-      if (!entry.keepDraft || !entry.text) continue;
-      const sameScope =
-        (!entry.taskId && tasks.draftMode) ||
-        (!!entry.taskId && entry.taskId === tasks.focusedTaskId);
-      if (!sameScope) continue;
-      tasks.prefillComposer(entry.text);
-      queueMicrotask(() => {
-        if (!tasks.composerPrefill) {
-          outboxRemove(vscode, entry.clientRequestId);
-        }
-      });
-    }
+    const rejected = outboxRejected(vscode);
+    if (rejected.length === 0) return;
+    // One at a time to avoid stomping composerPrefill.
+    const entry = rejected.find((e) => {
+      if (!e.text) return false;
+      return (
+        (!e.taskId && tasks.draftMode) || (!!e.taskId && e.taskId === tasks.focusedTaskId)
+      );
+    });
+    if (!entry) return;
+    tasks.prefillComposer(entry.text);
+    queueMicrotask(() => {
+      if (!tasks.composerPrefill) {
+        outboxRemove(vscode, entry.clientRequestId);
+      }
+    });
   });
 </script>
 

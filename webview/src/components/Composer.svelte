@@ -252,7 +252,7 @@
         model: model ?? undefined,
         continuationOf: tasks.continuationOf ?? undefined,
         createdAt: Date.now(),
-        keepDraft: true,
+        status: 'pending',
       });
       // DEBUG: temporary — remove after diagnosing grok→claude draft send.
       console.info('[muster][draft-send]', {
@@ -303,7 +303,7 @@
         text: displayText,
         llmText: llmText !== displayText ? llmText : undefined,
         createdAt: Date.now(),
-        keepDraft: true,
+        status: 'pending',
       });
     }
     post(payload);

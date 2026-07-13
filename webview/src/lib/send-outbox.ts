@@ -12,8 +12,11 @@ export interface OutboxEntry {
   model?: string;
   continuationOf?: string;
   createdAt: number;
-  /** Restore composer draft on sendRejected. */
-  keepDraft?: boolean;
+  /**
+   * pending: awaiting host ACK (eligible for resend, not draft restore)
+   * rejected: host NACK — restore draft when originating composer is empty
+   */
+  status: 'pending' | 'rejected';
 }
 
 const OUTBOX_KEY = 'muster.sendOutbox.v1';
@@ -44,8 +47,23 @@ function writeState(api: VsCodeStateApi | undefined, entries: OutboxEntry[]): vo
 
 export function outboxAdd(api: VsCodeStateApi | undefined, entry: OutboxEntry): void {
   const list = readState(api).filter((e) => e.clientRequestId !== entry.clientRequestId);
-  list.push(entry);
+  list.push({ ...entry, status: entry.status ?? 'pending' });
   writeState(api, list);
+}
+
+export function outboxMarkRejected(
+  api: VsCodeStateApi | undefined,
+  clientRequestId: string,
+): OutboxEntry | undefined {
+  const list = readState(api);
+  let found: OutboxEntry | undefined;
+  const next = list.map((e) => {
+    if (e.clientRequestId !== clientRequestId) return e;
+    found = { ...e, status: 'rejected' as const };
+    return found;
+  });
+  if (found) writeState(api, next);
+  return found;
 }
 
 export function outboxRemove(api: VsCodeStateApi | undefined, clientRequestId: string): void {
@@ -57,4 +75,12 @@ export function outboxRemove(api: VsCodeStateApi | undefined, clientRequestId: s
 
 export function outboxList(api: VsCodeStateApi | undefined): OutboxEntry[] {
   return readState(api);
+}
+
+export function outboxPending(api: VsCodeStateApi | undefined): OutboxEntry[] {
+  return readState(api).filter((e) => e.status !== 'rejected');
+}
+
+export function outboxRejected(api: VsCodeStateApi | undefined): OutboxEntry[] {
+  return readState(api).filter((e) => e.status === 'rejected');
 }
