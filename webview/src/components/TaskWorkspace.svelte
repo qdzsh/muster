@@ -187,7 +187,7 @@
     return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
   }
 
-  /** Banner uses lifecycle tone only — CLI process is shown near the composer. */
+  /** Banner uses lifecycle tone only — turn activity is shown near the composer. */
   const bannerTone = $derived(presentation?.lifecycle.tone ?? 'neutral');
 </script>
 
@@ -241,7 +241,7 @@
               aria-haspopup="menu"
               aria-expanded={statusMenuOpen ? 'true' : 'false'}
               aria-label={`Task status: ${presentation.lifecycle.label}. Click to change.`}
-              use:tip={'Change task status (user only — not CLI)'}
+              use:tip={'Change task status'}
               onclick={() => (statusMenuOpen = !statusMenuOpen)}
             >
               {presentation.lifecycle.label}
@@ -297,18 +297,9 @@
             {#if focused.hasOutcomeProposal && focused.lifecycle === 'open'}
               <div
                 class="task-workspace-orchestration"
-                use:tip={'Agent proposed completion; send a message to continue on the same task/session.'}
+                use:tip={'Agent proposed completion; send a message to continue on the same task.'}
               >
-                Agent proposed done — task stays open; chat to continue (session resume).
-              </div>
-            {/if}
-            {#if focused.committedSessionId}
-              <div
-                class="task-workspace-orchestration"
-                style="opacity: 0.55;"
-                use:tip={'CLI conversation session bound to this task'}
-              >
-                Session {focused.committedSessionId.slice(0, 12)}…
+                Agent proposed done — task stays open; chat to continue.
               </div>
             {/if}
             {#if focused.continuationOf}
@@ -397,10 +388,10 @@
 
     {#if showRecovery}
       <div class="task-action-panel task-action-panel--danger">
-        <div class="font-semibold">Turn recovery needed</div>
+        <div class="font-semibold">Turn could not finish</div>
         <p>{presentation.composerGuidance}</p>
         <p class="task-muted">
-          Task lifecycle remains <strong>Open</strong> — a failed CLI turn is not a sealed task failure.
+          Task lifecycle remains <strong>Open</strong> — a failed turn is not a sealed task failure.
         </p>
         {#if !hasRetryableTurn}
           <p class="task-muted">No retryable turn is available for this task.</p>

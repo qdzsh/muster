@@ -15,11 +15,10 @@
     runtimeBlocksComposer,
   } from '../lib/task-status';
   import {
-    CLI_LAST_EXIT_LABELS,
-    cliStatusFromTask,
-    getCliStatusPresentation,
-    type CliLastExit,
-  } from '../lib/cli-status';
+    getTurnActivityPresentation,
+    turnActivityFromTask,
+    type TurnActivityState,
+  } from '../lib/turn-activity';
   import type { AddContextAction } from '../lib/context-actions';
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
@@ -53,8 +52,6 @@
     task?: TaskSummary | null;
     /** @deprecated Prefer `task`. Kept for callers that only have viewStatus. */
     taskStatus?: TaskViewStatus;
-    /** Optional last process exit (host may project later). */
-    cliLastExit?: CliLastExit | null;
   }
 
   let {
@@ -65,32 +62,26 @@
     pendingAsk = null,
     task = null,
     taskStatus = 'idle',
-    cliLastExit = null,
   }: Props = $props();
 
   const thread = $derived(threadStore.current);
   const presentation = $derived(task ? getTaskPresentation(task) : getTaskStatusPresentation(taskStatus));
   const runtime = $derived(task ? effectiveRuntimeActivity(task) : null);
   const lifecycle = $derived(task?.lifecycle ?? (taskStatus as string));
-  const cliStatus = $derived(
-    task
-      ? cliStatusFromTask(task, {
-          // Generating only when streaming without a pending ask.
-          threadRunning: thread.running && !pendingAsk,
-          askPending: !!pendingAsk,
-          // Persist across reload: a committed session implies a prior process.
-          hadProcess: thread.hadProcess || !!task.committedSessionId,
-        })
-      : thread.running && !pendingAsk
-        ? ('running' as const)
-        : pendingAsk
-          ? ('idle' as const)
-          : ('not_started' as const),
-  );
-  const cliPresentation = $derived(getCliStatusPresentation(cliStatus));
-  const cliExitHint = $derived(
-    cliStatus === 'stopped' && cliLastExit ? CLI_LAST_EXIT_LABELS[cliLastExit] : null,
-  );
+  const turnActivity = $derived.by((): TurnActivityState => {
+    if (task) {
+      return turnActivityFromTask(task, {
+        threadRunning: thread.running && !pendingAsk,
+        askPending: !!pendingAsk,
+      });
+    }
+    if (pendingAsk || taskStatus === 'waiting_user') return 'waiting_you';
+    if (thread.running || taskStatus === 'running') return 'executing';
+    if (taskStatus === 'queued') return 'queued';
+    if (taskStatus === 'needs_recovery') return 'failed_turn';
+    return 'null';
+  });
+  const turnPresentation = $derived(getTurnActivityPresentation(turnActivity));
 
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
   let highlightEl = $state<HTMLDivElement | undefined>(undefined);
@@ -145,11 +136,11 @@
       syncHighlightScroll();
     });
   });
-  // Stop applies while a process is up (generating or idle/waiting_user).
+  // Stop this turn while a live turn is executing or waiting for the user.
   const canCancel = $derived(
     mode === 'task' &&
-      (cliStatus === 'running' ||
-        cliStatus === 'idle' ||
+      (turnActivity === 'executing' ||
+        turnActivity === 'waiting_you' ||
         runtime === 'running' ||
         runtime === 'waiting_user' ||
         taskStatus === 'running' ||
@@ -422,9 +413,10 @@
     }
   }
 
-  /** Interrupt & send only while a turn is generating — idle Ctrl+Enter uses ordinary send. */
+  /** Interrupt & send only while a turn is executing — waiting_you Ctrl+Enter uses ordinary send. */
   const liveInjectEligible = $derived(
-    mode === 'task' && (runtime === 'running' || taskStatus === 'running' || cliStatus === 'running'),
+    mode === 'task' &&
+      (runtime === 'running' || taskStatus === 'running' || turnActivity === 'executing'),
   );
 
   function onKeydown(e: KeyboardEvent) {
@@ -700,24 +692,22 @@
   ondragleave={onDragLeave}
   ondrop={onDrop}
 >
-  {#if mode === 'task'}
+  {#if mode === 'task' && turnPresentation.showStrip}
     <div
-      class={`cli-status-bar cli-status-bar--${cliPresentation.tone}`}
-      data-cli-status={cliStatus}
+      class={`turn-activity-bar turn-activity-bar--${turnPresentation.tone}`}
+      data-turn-activity={turnActivity}
       role="status"
       aria-live="polite"
-      use:tip={cliPresentation.detail}
+      use:tip={turnPresentation.detail}
     >
       <span
-        class="codicon codicon-{cliPresentation.icon}"
-        class:codicon-modifier-spin={cliStatus === 'running'}
+        class="codicon codicon-{turnPresentation.icon}"
+        class:codicon-modifier-spin={turnActivity === 'executing'}
         aria-hidden="true"
       ></span>
-      <span class="cli-status-bar__label">{cliPresentation.label}</span>
-      <span class="cli-status-bar__sep" aria-hidden="true">·</span>
-      <span class="cli-status-bar__hint">
-        {cliExitHint ?? cliPresentation.hint}
-      </span>
+      <span class="turn-activity-bar__label">{turnPresentation.label}</span>
+      <span class="turn-activity-bar__sep" aria-hidden="true">·</span>
+      <span class="turn-activity-bar__hint">{turnPresentation.hint}</span>
     </div>
   {/if}
 
@@ -854,8 +844,8 @@
           class="icon-btn"
           style="width: 28px; height: 28px;"
           onclick={cancel}
-          aria-label="Stop"
-          use:tip={'Stop'}
+          aria-label="Stop this turn"
+          use:tip={'Stop this turn'}
         >
           <span class="codicon codicon-debug-stop"></span>
         </button>

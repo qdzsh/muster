@@ -88,10 +88,10 @@ describe('task status dual-axis presentation', () => {
     });
 
     expect(presentation.lifecycle.label).toBe('Open');
-    expect(presentation.runtime?.label).toBe('Running');
-    expect(presentation.label).toBe('Running');
+    expect(presentation.runtime?.label).toBe('Working');
+    expect(presentation.label).toBe('Working');
     expect(presentation.listCopy).toContain('Open');
-    expect(presentation.workspaceDetail).toContain('CLI process');
+    expect(presentation.workspaceDetail).toMatch(/turn is executing/i);
   });
 
   it('uses failed lifecycle (soft) without treating it as hard terminal', () => {
@@ -121,7 +121,7 @@ describe('task status dual-axis presentation', () => {
 
   it('exposes labels through the presentation lookup', () => {
     expect(taskStatusLabel('waiting_dependencies')).toBe('Waiting on dependencies');
-    expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toMatch(/recovery/i);
+    expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toMatch(/could not finish/i);
   });
 
   it('falls back safely for malformed host values', () => {

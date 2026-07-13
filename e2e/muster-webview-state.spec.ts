@@ -198,8 +198,8 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toHaveCount(0);
     await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
     await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toBeVisible();
-    // Transcript present ⇒ prior process (hadProcess); CLI strip shows stopped, not not_started.
-    await expect(page.locator('[data-cli-status="stopped"]').getByText(/CLI stopped/i)).toBeVisible();
+    // Between turns / idle open: no turn-activity strip (ready).
+    await expect(page.locator('[data-turn-activity]')).toHaveCount(0);
     await expect(page.getByText('Harness ready.')).toBeVisible();
   });
 
@@ -507,16 +507,16 @@ test.describe('Muster webview host state smoke', () => {
 
     await expect(page.locator('.task-workspace-banner').getByText('Run the model evaluation')).toBeVisible();
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    await expect(page.locator('[data-cli-status="running"]').getByText(/CLI running/i)).toBeVisible();
+    await expect(page.locator('[data-turn-activity="executing"]').getByText(/Working/i)).toBeVisible();
     await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
-    await expect(page.getByRole('button', { name: /Run the model evaluation.*Task Open.*CLI running.*Backend claude/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /Run the model evaluation.*Task Open.*Turn working.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Cancelled rollout.*Task Cancelled.*Backend claude/i })).toBeVisible();
     await page.getByRole('button', { name: 'Close history' }).click();
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    await expect(page.locator('[data-cli-status="running"]')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
-    await page.getByRole('button', { name: 'Stop' }).click();
+    await expect(page.locator('[data-turn-activity="executing"]')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop this turn' })).toBeVisible();
+    await page.getByRole('button', { name: 'Stop this turn' }).click();
     await expectPostedMessage(page, {
       type: 'cancelTurn',
       taskId: 'task-running',
@@ -540,7 +540,7 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    await expect(page.locator('[data-cli-status="stopped"]').getByText(/CLI stopped/i)).toBeVisible();
+    await expect(page.locator('[data-turn-activity="failed_turn"]').getByText(/Could not finish/i)).toBeVisible();
     await expect(page.locator('.task-action-panel--danger').getByText('No retryable turn is available for this task.')).toBeVisible();
     await expect(page.locator('.task-action-panel--danger').getByText(/Task lifecycle remains/i)).toBeVisible();
     await expect(page.getByText('Recovery actions need a retryable turn.')).toBeVisible();
@@ -734,14 +734,14 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    // ask_user: process on, not generating → CLI idle
-    await expect(page.locator('[data-cli-status="idle"]').getByText(/CLI idle/i)).toBeVisible();
+    // Structured ask: turn waiting for user.
+    await expect(page.locator('[data-turn-activity="waiting_you"]').getByText(/Waiting for you/i)).toBeVisible();
     await expect(page.getByText('Agent question')).toBeVisible();
     await expect(page.getByText('Which model should continue?')).toBeVisible();
     await expect(page.locator('.composer-guidance').getByText('Answer the pending task question above to continue.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
-    // Process is still up (CLI idle) — Stop remains available to abort the turn.
-    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
+    // Live turn still open — Stop this turn remains available.
+    await expect(page.getByRole('button', { name: 'Stop this turn' })).toBeVisible();
     await page.locator('vscode-radio').filter({ hasText: 'Claude' }).click();
     await page.getByRole('button', { name: 'Accept' }).click();
     await expectPostedMessage(page, {
@@ -780,9 +780,9 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.getByText('Agent question')).toHaveCount(0);
-    // ask_user without pending card: process still on → CLI idle (not running).
-    await expect(page.locator('[data-cli-status="idle"]').getByText(/CLI idle/i)).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
+    // waiting_user without pending card: still Waiting for you.
+    await expect(page.locator('[data-turn-activity="waiting_you"]').getByText(/Waiting for you/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop this turn' })).toBeVisible();
   });
 
   test('RFD form shows validation errors and unlocks after host rejection', async ({ page }) => {
@@ -997,7 +997,7 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 100,
     });
 
-    await expect(page.locator('[data-cli-status="running"]')).toBeVisible();
+    await expect(page.locator('[data-turn-activity="executing"]')).toBeVisible();
     await expect(
       page.locator('.composer-guidance').getByText(/Enter queues a follow-up turn/i),
     ).toBeVisible();

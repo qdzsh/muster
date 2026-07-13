@@ -176,8 +176,8 @@ body {
   color: var(--vscode-descriptionForeground);
 }
 
-/* Coarse CLI process status — lives near the composer, not the task badge. */
-.cli-status-bar {
+/* Turn activity strip — near the composer (not task lifecycle badge). */
+.turn-activity-bar {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -189,37 +189,41 @@ body {
   background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
 }
 
-.cli-status-bar--muted {
+.turn-activity-bar--muted {
   color: var(--vscode-descriptionForeground);
 }
 
-.cli-status-bar--attention {
+.turn-activity-bar--attention {
   color: var(--vscode-charts-yellow, #cca700);
 }
 
-.cli-status-bar--info,
-.cli-status-bar--neutral {
+.turn-activity-bar--info,
+.turn-activity-bar--neutral {
   color: var(--vscode-charts-blue, #3794ff);
 }
 
-.cli-status-bar--success {
+.turn-activity-bar--danger {
+  color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.turn-activity-bar--success {
   color: var(--vscode-testing-iconPassed, #73c991);
 }
 
-.cli-status-bar__label {
+.turn-activity-bar__label {
   font-weight: 600;
 }
 
-.cli-status-bar__sep {
+.turn-activity-bar__sep {
   opacity: 0.45;
 }
 
-.cli-status-bar__hint {
+.turn-activity-bar__hint {
   opacity: 0.65;
   font-weight: 400;
 }
 
-.cli-live-dot {
+.turn-live-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;

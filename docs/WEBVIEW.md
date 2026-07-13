@@ -248,7 +248,7 @@ Source of truth for event shapes: [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md). UI rules
 
 | Event | Render | Component | Notes |
 |-------|--------|-----------|-------|
-| `sessionStarted` | Status chip / toolbar hint | `Toolbar` | Show session ID truncated; optional |
+| `sessionStarted` | Internal / optional debug only | — | **Do not** show session id in product chrome (Phase A+) |
 | `assistantDelta` | Append to open bubble | `MessageBubble` | Group by `messageId`; same ID → same bubble |
 | `reasoningDelta` | Append in collapsible | `ReasoningBlock` | Group by `messageId` (like `assistantDelta`); default collapsed; muted style |
 | `toolStarted` | New card, running state | `ToolCard` | Show `name`, `kind`; MCP badge if `kind === 'mcp'` |
@@ -442,23 +442,25 @@ The webview never holds the whole thread. Render a **recent window**; older item
 ### Session / tasks
 
 - **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask` (`lifecycle: open`).
-- **Three status axes** (see `TASK-MANAGEMENT.md` §4.3):
+- **Status axes** (see `TASK-MANAGEMENT.md` §4.3; Phase A of
+  `docs/plans/task-chat-turn-hide-cli.md`):
   - **Task lifecycle** on list + **workspace status card header**: `open` /
     `succeeded` / `failed` / `cancelled` / `skipped`.
-  - **CLI view** on the **composer strip**: `not_started` / `running` / `idle` /
-    `stopped`. Optional subtitle for `lastExit` (`ok` / `error` / `cancelled`)
-    when stopped. **Error is not a CLI phase.**
+  - **Turn activity** on the **composer strip** (`data-turn-activity`):
+    `executing` (“Working”), `waiting_you`, `queued`, `failed_turn`
+    (“Could not finish”). **No strip** when ready / between turns. Product UI
+    must **not** show CLI process vocabulary (`CLI running/stopped/idle`).
   - **Orchestration** (deps, children, recovery, outcome proposal): action panels
     or expand-details one-liners — not the task badge, not a second App header row.
-  Do **not** set task lifecycle from `turnDone` / CLI errors alone.
+  Do **not** set task lifecycle from `turnDone` / adapter errors alone.
 - **Workspace header = task status card** (not a duplicate title/status bar):
   name + lifecycle badge + **status menu** (`setTaskLifecycle`). **Expand task
-  details** (collapsed by default) for lifecycle copy, orchestration hint, bound
-  session id; keep collapsed chrome free of “Task is open / Session ses_…” noise.
-- **CLI mapping:** live generating → `running`; `waiting_user` / process alive
-  not generating → `idle`; never spawned / only queued → `not_started`; process
-  exited → `stopped`. After reload, derive prior process from `hadProcess` and/or
-  `committedSessionId` when host has not projected `cliViewStatus`.
+  details** (collapsed by default) for lifecycle copy and orchestration hint;
+  do **not** show bound session id in product chrome (Phase A).
+- **Turn activity mapping (Phase A client derive; Phase B host-owned):** live
+  generating → `executing`; `waiting_user` / pending ask → `waiting_you`;
+  queued only → `queued`; `needs_recovery` → `failed_turn`; otherwise no strip.
+  Stop control is labeled **Stop this turn**.
 - **Who seals outcomes:** **user** always (status menu → `setTaskLifecycle`);
   **coordinator** when the user enables outcome delegation (`coordinator_delegate`
   / future `yolo`). See `TASK-MANAGEMENT.md` §4.1.1.

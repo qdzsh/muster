@@ -136,11 +136,11 @@ export const RUNTIME_PRESENTATIONS = {
   },
   running: {
     key: 'running',
-    label: 'Running',
+    label: 'Working',
     tone: 'attention',
-    listCopy: 'CLI turn active',
+    listCopy: 'Turn active',
     workspaceHeadline: 'Turn is running',
-    workspaceDetail: 'A CLI process is active for this task (runtime only — not task outcome).',
+    workspaceDetail: 'A turn is executing for this task (not a sealed task outcome).',
     composerGuidance:
       'Enter queues a follow-up turn; Ctrl+Enter interrupts and sends.',
   },
@@ -173,13 +173,13 @@ export const RUNTIME_PRESENTATIONS = {
   },
   needs_recovery: {
     key: 'needs_recovery',
-    label: 'Needs recovery',
+    label: 'Could not finish',
     tone: 'danger',
-    listCopy: 'Turn recovery needed',
-    workspaceHeadline: 'Turn recovery needed',
+    listCopy: 'Turn needs attention',
+    workspaceHeadline: 'Turn could not finish',
     workspaceDetail:
-      'The last CLI turn failed or was interrupted. The task remains open until you recover or continue.',
-    composerGuidance: 'Retry or continue with recovery instructions — this is not a sealed task failure.',
+      'The last turn failed or was interrupted. The task remains open until you retry or continue.',
+    composerGuidance: 'Retry or continue with instructions — this is not a sealed task failure.',
   },
   idle: {
     key: 'idle',
