@@ -428,17 +428,28 @@
 
         case 'sendRejected': {
           const rejected = outboxList(vscode).find((e) => e.clientRequestId === msg.clientRequestId);
-          // Restore draft only when scoped to the focused task (or draft/new-task)
-          // and composer is empty — never overwrite a newer draft the user typed.
+          // Keep outbox entry until draft is restored into the originating composer.
+          // Composer only applies prefill when empty, so we re-attempt on focus changes.
           if (rejected?.keepDraft && rejected.text) {
             const sameScope =
               (!rejected.taskId && tasks.draftMode) ||
               (!!rejected.taskId && rejected.taskId === tasks.focusedTaskId);
             if (sameScope) {
               tasks.prefillComposer(rejected.text);
+              // Composer clears prefill when empty and applies it; remove only then.
+              // If composer was non-empty, leave outbox so user can still recover text
+              // via a later empty-composer focus or manual clear.
+              queueMicrotask(() => {
+                // Best-effort: if prefill was consumed (composerPrefill cleared), drop outbox.
+                if (!tasks.composerPrefill) {
+                  outboxRemove(vscode, msg.clientRequestId);
+                }
+              });
             }
+            // Wrong scope: keep outbox entry for later when user focuses that task.
+          } else {
+            outboxRemove(vscode, msg.clientRequestId);
           }
-          outboxRemove(vscode, msg.clientRequestId);
           if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
             tasks.setCommandError(msg.reason, msg.taskId ?? null);
           }
@@ -476,6 +487,25 @@
   });
 
   let outboxReplayed = false;
+
+  // After focus changes, try restoring any rejected drafts still held in outbox.
+  $effect(() => {
+    void tasks.focusedTaskId;
+    void tasks.draftMode;
+    for (const entry of outboxList(vscode)) {
+      if (!entry.keepDraft || !entry.text) continue;
+      const sameScope =
+        (!entry.taskId && tasks.draftMode) ||
+        (!!entry.taskId && entry.taskId === tasks.focusedTaskId);
+      if (!sameScope) continue;
+      tasks.prefillComposer(entry.text);
+      queueMicrotask(() => {
+        if (!tasks.composerPrefill) {
+          outboxRemove(vscode, entry.clientRequestId);
+        }
+      });
+    }
+  });
 </script>
 
 {#if protocolMismatch}
