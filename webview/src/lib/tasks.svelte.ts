@@ -56,6 +56,12 @@ class TasksState {
    */
   queuedTurns = $state<QueuedTurnProjection[]>([]);
 
+  /**
+   * One-shot prefill for the composer (queue Edit → message box).
+   * Composer consumes and clears when `nonce` changes.
+   */
+  composerPrefill = $state<{ text: string; nonce: number } | null>(null);
+
   constructor() {
     // Restore the last-used backend/model from webview state (persists across reloads).
     try {
@@ -237,6 +243,20 @@ class TasksState {
     this.commandNotice = message ? { taskId, message } : null;
     // A delivered acknowledgement clears a prior refusal so success is visible.
     if (message) this.commandError = null;
+  }
+
+  /** Put text into the task/draft composer (used by queue Edit). */
+  prefillComposer(text: string): void {
+    this.composerPrefill = { text, nonce: Date.now() };
+  }
+
+  clearComposerPrefill(): void {
+    this.composerPrefill = null;
+  }
+
+  /** Optimistic remove so Delete/Edit feedback is immediate before host snapshot. */
+  removeQueuedTurnLocally(turnId: string): void {
+    this.queuedTurns = this.queuedTurns.filter((turn) => turn.turnId !== turnId);
   }
 
   private seedWatermark(taskId: string, revision: number): void {

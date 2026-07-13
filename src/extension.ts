@@ -1150,8 +1150,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           });
           if (outcome.kind === 'error') {
             this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
+          } else {
+            // Always reproject so queue panel / previewText stay authoritative.
+            this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
           }
-          // Success: store onCommit projects updated snapshot/taskUpdated.
           break;
         }
         case 'deleteQueuedTurn': {
@@ -1169,8 +1171,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           });
           if (outcome.kind === 'error') {
             this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
+          } else {
+            this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
           }
-          // Success: store onCommit projects updated snapshot/taskUpdated.
           break;
         }
         case 'resumeQueuedTurn':

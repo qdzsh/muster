@@ -1112,24 +1112,31 @@ test.describe('Muster webview host state smoke', () => {
     const item = panel.locator('.queued-turn-item[data-turn-id="turn-q1"]');
     await expect(item).toHaveAttribute('data-queued-locked', 'false');
 
-    await item.getByRole('button', { name: 'Edit' }).click();
-    const editor = page.getByLabel('Edit queued turn 1');
-    await expect(editor).toBeVisible();
-    // vscode-textarea is a custom element; set the host value and fire input so Svelte bind:value updates.
-    await editor.evaluate((el, value) => {
-      const host = el as HTMLElement & { value?: string };
-      host.value = value;
-      host.dispatchEvent(new Event('input', { bubbles: true }));
-    }, 'Edited queued follow-up');
-    await page.getByRole('button', { name: 'Save edit' }).click();
+    // Edit: remove from queue + prefill composer message box for re-send.
+    await item.getByRole('button', { name: 'Edit queued turn 1' }).click();
     await expectPostedMessage(page, {
-      type: 'editQueuedTurn',
+      type: 'deleteQueuedTurn',
       taskId: 'task-queue',
       turnId: 'turn-q1',
-      content: 'Edited queued follow-up',
     });
+    await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
+    const composer = page.getByRole('textbox').first();
+    await expect(composer).toHaveValue('First queued follow-up');
 
-    // Host reflects the edit in the next snapshot projection.
+    // Host confirms empty queue.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      focusedTaskId: 'task-queue',
+      subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      transcript: [{ id: 'msg-assistant', kind: 'assistant', content: 'Still working…' }],
+      activeTurnId: 'turn-active',
+      queuedTurns: [],
+      storeRevision: 121,
+    });
+    await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
+
+    // Re-queue a row to exercise Delete.
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
@@ -1139,42 +1146,24 @@ test.describe('Muster webview host state smoke', () => {
       activeTurnId: 'turn-active',
       queuedTurns: [
         {
-          turnId: 'turn-q1',
-          sequence: 1,
+          turnId: 'turn-q2',
+          sequence: 2,
           status: 'queued',
-          messageIds: [queuedMessageId],
-          createdAt: '2026-01-01T00:00:01.000Z',
-          previewText: 'Edited queued follow-up',
+          messageIds: ['msg-queued-2'],
+          createdAt: '2026-01-01T00:00:02.000Z',
+          previewText: 'Second queued follow-up',
         },
       ],
-      storeRevision: 121,
+      storeRevision: 122,
     });
-    await expect(panel.getByText('Edited queued follow-up')).toBeVisible();
-
-    await item.getByRole('button', { name: 'Delete' }).click();
+    const item2 = page.locator('.queued-turn-item[data-turn-id="turn-q2"]');
+    await item2.getByRole('button', { name: 'Delete queued turn 2' }).click();
     await expectPostedMessage(page, {
       type: 'deleteQueuedTurn',
       taskId: 'task-queue',
-      turnId: 'turn-q1',
-    });
-
-    // Drain projection: turn left the queue (started as next chat turn).
-    await postSnapshot(page, {
-      type: 'snapshot',
-      rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
-      focusedTaskId: 'task-queue',
-      subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
-      transcript: [
-        { id: 'msg-assistant', kind: 'assistant', content: 'Still working…' },
-        { id: queuedMessageId, kind: 'user', content: 'Edited queued follow-up' },
-      ],
-      activeTurnId: 'turn-q1',
-      queuedTurns: [],
-      storeRevision: 122,
+      turnId: 'turn-q2',
     });
     await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
-    // Dispatched follow-up is now in chat, not in the queue panel.
-    await expect(page.getByText('Edited queued follow-up')).toBeVisible();
     await expect(page.getByRole('alert')).toHaveCount(0);
   });
 });

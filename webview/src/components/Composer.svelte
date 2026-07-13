@@ -99,6 +99,7 @@
   let isExplorerDrag = $state(false);
   let dropFeedback = $state<string | null>(null);
   let isAddContextMenuOpen = $state(false);
+  let lastPrefillNonce = $state<number | null>(null);
 
   /** Highlight layer mirrors draft; trailing newline needs an extra break for height parity. */
   const draftHighlightHtml = $derived.by(() => {
@@ -122,6 +123,24 @@
   // Draft still waits for the first turn to settle. Task mode stays open while
   // a live/queued turn is active so Enter queues and Ctrl+Enter can inject.
   const canSend = $derived(mode === 'draft' ? !thread.running : !blocked);
+
+  // Queue panel Edit → load text into the message box for re-send.
+  $effect(() => {
+    const prefill = tasks.composerPrefill;
+    if (!prefill || prefill.nonce === lastPrefillNonce) return;
+    if (!canSend) return;
+    lastPrefillNonce = prefill.nonce;
+    draftText = prefill.text;
+    mentionBindings = new Map();
+    dropFeedback = null;
+    tasks.clearComposerPrefill();
+    queueMicrotask(() => {
+      textareaEl?.focus();
+      const len = draftText.length;
+      textareaEl?.setSelectionRange(len, len);
+      syncHighlightScroll();
+    });
+  });
   // Stop applies while a process is up (generating or idle/waiting_user).
   const canCancel = $derived(
     mode === 'task' &&

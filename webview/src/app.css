@@ -354,6 +354,32 @@ body {
   gap: 6px;
 }
 
+.queued-turn-action {
+  appearance: none;
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border-radius: 4px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.queued-turn-action:hover:not(:disabled) {
+  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground));
+}
+
+.queued-turn-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.queued-turn-action--danger {
+  color: var(--vscode-errorForeground, #f14c4c);
+  border-color: color-mix(in srgb, var(--vscode-errorForeground, #f14c4c) 40%, var(--vscode-panel-border));
+}
+
 .task-action-panel--warning {
   border-color: var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground, #cca700));
   background: var(
