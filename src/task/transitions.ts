@@ -5,6 +5,7 @@ import type {
   TaskDependency,
   TaskExecutionPolicy,
   TaskLifecycleState,
+  TaskMessage,
   TaskRole,
   TaskTurn,
   TurnDisposition,
@@ -207,9 +208,9 @@ function queueTurn(
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is terminal' };
   }
-  if (hasActiveOrQueuedTurn(turns)) {
-    return { ok: false, reason: 'task already has an active or queued turn' };
-  }
+  // R012: allow multiple FIFO queued turns (and queue behind a live turn).
+  // One-at-a-time execution is enforced by canPromoteTurn / scheduler, not here.
+  // Retry still uses exclusive queue via retryTurn's hasActiveOrQueuedTurn guard.
 
   const turn: TaskTurn = {
     id: options.turnId,
@@ -278,8 +279,10 @@ export function continueTask(
   turns: readonly TaskTurn[],
   options: QueueTurnOptions,
 ): TransitionResult<TaskTurn> {
-  if (!turns.some((turn) => isSettledTurn(turn.status))) {
-    return { ok: false, reason: 'continueTask requires at least one settled turn' };
+  // R012: allow FIFO follow-up turns while a prior turn is still live/queued.
+  // startTask covers the empty-history case; continue requires at least one prior turn.
+  if (turns.length === 0) {
+    return { ok: false, reason: 'continueTask requires at least one prior turn' };
   }
   return queueTurn(task, turns, options);
 }
@@ -643,6 +646,103 @@ export function cancelPendingTurn(
   return { ok: false, reason: 'turn is not pending' };
 }
 
+/**
+ * R013: pure predicate for editing an undispatched queued follow-up.
+ * Mutates only the bound pending user message content once applied by the engine.
+ * Fail-closed at the queued→running assign boundary (status !== 'queued' or message not pending).
+ */
+export function prepareEditQueuedTurn(
+  taskId: string,
+  turn: TaskTurn | undefined,
+  messages: Readonly<Record<string, TaskMessage>>,
+  content: string,
+): TransitionResult<{ messageId: string; content: string }> {
+  if (!turn) {
+    return { ok: false, reason: 'turn not found' };
+  }
+  if (turn.taskId !== taskId) {
+    return { ok: false, reason: 'turn does not belong to task' };
+  }
+  if (turn.status !== 'queued') {
+    return { ok: false, reason: 'turn is not queued' };
+  }
+
+  const trimmed = content.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: 'invalid content' };
+  }
+
+  const messageIds = messageIdsFromInputs(turn.inputs);
+  if (messageIds.length === 0) {
+    return { ok: false, reason: 'message not found' };
+  }
+  // One-message-per-turn FIFO: edit the first (only) bound user message.
+  // Multi-message inputs are not expected for R012 queue entries, but we still
+  // validate every bound message is a pending user message on this task.
+  for (const messageId of messageIds) {
+    const message = messages[messageId];
+    if (!message) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.taskId !== taskId) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.role !== 'user') {
+      return { ok: false, reason: 'message is not pending' };
+    }
+    if (message.state !== 'pending') {
+      return { ok: false, reason: 'message is not pending' };
+    }
+  }
+
+  return {
+    ok: true,
+    next: { messageId: messageIds[0]!, content: trimmed },
+    effects: [],
+  };
+}
+
+/**
+ * R013: pure predicate for deleting an undispatched queued follow-up turn.
+ * Removes the turn row and its bound pending user messages only — no cancelProcess,
+ * no lifecycle change, no mutation of live/settled turns.
+ */
+export function prepareDeleteQueuedTurn(
+  taskId: string,
+  turn: TaskTurn | undefined,
+  messages: Readonly<Record<string, TaskMessage>>,
+): TransitionResult<{ turnId: string; messageIds: string[] }> {
+  if (!turn) {
+    return { ok: false, reason: 'turn not found' };
+  }
+  if (turn.taskId !== taskId) {
+    return { ok: false, reason: 'turn does not belong to task' };
+  }
+  if (turn.status !== 'queued') {
+    return { ok: false, reason: 'turn is not queued' };
+  }
+
+  const messageIds = messageIdsFromInputs(turn.inputs);
+  for (const messageId of messageIds) {
+    const message = messages[messageId];
+    if (!message) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.taskId !== taskId) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.role !== 'user' || message.state !== 'pending') {
+      return { ok: false, reason: 'message is not pending' };
+    }
+  }
+
+  return {
+    ok: true,
+    next: { turnId: turn.id, messageIds },
+    effects: [],
+  };
+}
+
 export function applyDependencyTerminal(
   task: MusterTask,
   pendingTurn: TaskTurn | undefined,
@@ -889,3 +989,20 @@ export function stageDisposition(
 
   return { ok: false, reason: 'disposition already staged with a different opId' };
 }
+
+/**
+ * MEM030: mark already-queued follow-ups so they are not auto-promoted after a
+ * failed/interrupted live settlement. Call inside the same commit that settles
+ * the live turn, before creating post-settlement retry/recovery turns.
+ */
+export function holdQueuedFollowUpsOnFailure(
+  draft: { turns: Record<string, TaskTurn> },
+  taskId: string,
+): void {
+  for (const turn of Object.values(draft.turns)) {
+    if (turn.taskId !== taskId || turn.status !== 'queued') continue;
+    if (turn.holdAutoPromote) continue;
+    draft.turns[turn.id] = { ...turn, holdAutoPromote: true };
+  }
+}
+

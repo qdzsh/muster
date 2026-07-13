@@ -28,9 +28,14 @@ function isSafeOwnedDropDir(full: string, uid: number | undefined): boolean {
   try {
     const st = fs.lstatSync(full);
     if (!st.isDirectory() || st.isSymbolicLink()) return false;
-    if (typeof uid === 'number' && typeof st.uid === 'number' && st.uid !== uid) return false;
-    // Reject world/group-writable drop dirs when mode is available.
-    if (typeof st.mode === 'number' && (st.mode & 0o022) !== 0) return false;
+    // POSIX ownership/mode checks are meaningful only when getuid exists.
+    // On Windows, temp dir modes are not unix-permission accurate (often 666),
+    // so require only that the path is a real non-symlink directory.
+    if (typeof uid === 'number') {
+      if (typeof st.uid === 'number' && st.uid !== uid) return false;
+      // Reject world/group-writable drop dirs when mode is available.
+      if (typeof st.mode === 'number' && (st.mode & 0o022) !== 0) return false;
+    }
     return true;
   } catch {
     return false;

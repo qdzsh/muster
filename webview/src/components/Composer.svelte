@@ -32,6 +32,12 @@
     expandMentionsForLlm,
     type MentionBindingMap,
   } from '../lib/file-mention-bindings';
+  import {
+    buildTaskComposerMessage,
+    resolveComposerKeyIntent,
+    shouldPreventDefaultForComposerKey,
+    type ComposerSubmitIntent,
+  } from '../lib/composer-submit';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -102,18 +108,20 @@
   });
 
   // Terminal lifecycles stay writable: host send reopens the same task to open.
+  // Live/queued stay writable so Enter queues FIFO follow-ups and Ctrl+Enter can inject.
   const statusBlocksSend = $derived(
     task
       ? runtimeBlocksComposer(runtime)
-      : taskStatus === 'running' ||
-          taskStatus === 'queued' ||
-          taskStatus === 'waiting_dependencies' ||
+      : // Legacy viewStatus path: keep running/queued unlocked (FIFO + live inject).
+        taskStatus === 'waiting_dependencies' ||
           taskStatus === 'waiting_children' ||
           taskStatus === 'waiting_user' ||
           taskStatus === 'needs_recovery',
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
-  const canSend = $derived(mode === 'draft' ? !thread.running : !thread.running && !blocked);
+  // Draft still waits for the first turn to settle. Task mode stays open while
+  // a live/queued turn is active so Enter queues and Ctrl+Enter can inject.
+  const canSend = $derived(mode === 'draft' ? !thread.running : !blocked);
   // Stop applies while a process is up (generating or idle/waiting_user).
   const canCancel = $derived(
     mode === 'task' &&
@@ -171,7 +179,7 @@
     return () => window.removeEventListener('pointerdown', onPointerDown, true);
   });
 
-  function send() {
+  function submitComposer(intent: Exclude<ComposerSubmitIntent, { kind: 'none' }>) {
     if (!canSend) return;
     const displayText = draftText.trim();
     if (!displayText) return;
@@ -180,6 +188,7 @@
     const llmText = expandMentionsForLlm(displayText, mentionBindings);
 
     if (mode === 'draft') {
+      // Draft has no live-inject path — treat any submit as create-task send.
       const backend = resolveBackendForSend();
       tasks.setBackend(backend);
       const payload: {
@@ -204,18 +213,43 @@
         content: displayText,
       });
       post(payload);
-    } else if (taskId) {
-      const payload: { type: 'send'; taskId: string; text: string; llmText?: string } = {
-        type: 'send',
-        taskId,
-        text: displayText,
-      };
-      if (llmText !== displayText) payload.llmText = llmText;
-      post(payload);
+      draftText = '';
+      mentionBindings = new Map();
+      return;
     }
 
+    if (intent.kind === 'sendLiveInput') {
+      // Expanded mention paths go in instruction; inject never falls through to queue.
+      const message = buildTaskComposerMessage(intent, {
+        taskId,
+        text: displayText,
+        llmText,
+      });
+      if (!message) return;
+      post(message);
+      draftText = '';
+      mentionBindings = new Map();
+      return;
+    }
+
+    if (!taskId) return;
+    const payload = buildTaskComposerMessage(intent, {
+      taskId,
+      text: displayText,
+      llmText,
+    });
+    if (!payload || payload.type !== 'send') return;
+    post(payload);
     draftText = '';
     mentionBindings = new Map();
+  }
+
+  function send() {
+    submitComposer({ kind: 'send' });
+  }
+
+  function sendLiveInput() {
+    submitComposer({ kind: 'sendLiveInput' });
   }
 
   function cancel() {
@@ -350,6 +384,11 @@
     }
   }
 
+  /** Live inject only while a turn is generating — idle Ctrl+Enter uses ordinary send. */
+  const liveInjectEligible = $derived(
+    mode === 'task' && (runtime === 'running' || taskStatus === 'running' || cliStatus === 'running'),
+  );
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape' && isAddContextMenuOpen) {
       e.preventDefault();
@@ -357,13 +396,22 @@
       return;
     }
 
-    // Ignore Enter while an IME composition is active (CJK/Vietnamese input);
-    // keyCode 229 is the legacy signal for the same.
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    const policyInput = {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+    };
+    const keyOpts = { mode, liveInjectEligible };
+    const intent = resolveComposerKeyIntent(policyInput, keyOpts);
+    if (intent.kind === 'none') return;
+    if (shouldPreventDefaultForComposerKey(policyInput, keyOpts)) {
       e.preventDefault();
-      send();
     }
+    submitComposer(intent);
   }
 
   /** True when lifecycle is sealed; composer stays enabled and send reopens. */
@@ -373,7 +421,7 @@
       : isHardTerminal(taskStatus) || taskStatus === 'failed',
   );
 
-  /** Blocks send (busy/gated). Terminal reopenable is NOT a block. */
+  /** Blocks send (busy/gated). Terminal reopenable is NOT a block. Live/queued are not blocks. */
   const blockReason = $derived.by(() => {
     if (mode === 'draft') return '';
     if (pendingAsk) return 'Answer the pending task question above to continue.';
@@ -382,8 +430,6 @@
       if (readOnly) return 'This task is read-only right now.';
       return '';
     }
-    if (taskStatus === 'running') return presentation.composerGuidance;
-    if (taskStatus === 'queued') return presentation.composerGuidance;
     if (taskStatus === 'waiting_dependencies') return presentation.composerGuidance;
     if (taskStatus === 'waiting_children') return presentation.composerGuidance;
     if (taskStatus === 'waiting_user') return presentation.composerGuidance;
@@ -392,13 +438,25 @@
     return '';
   });
 
+  /** Non-blocking affordance copy while live/queued (composer remains editable). */
+  const liveComposerGuidance = $derived.by(() => {
+    if (mode !== 'task' || blockReason) return '';
+    if (task) {
+      if (runtime === 'running' || runtime === 'queued') return presentation.composerGuidance;
+      return '';
+    }
+    if (taskStatus === 'running' || taskStatus === 'queued') return presentation.composerGuidance;
+    return '';
+  });
+
   /**
-   * Composer note only for blocked/busy states.
+   * Composer note for blocked/busy states and live queue affordance.
    * Terminal reopen warning lives once in TaskWorkspace (panel + Reopen button).
    */
   const composerNote = $derived.by(() => {
     if (mode === 'draft') return '';
     if (blockReason) return blockReason;
+    if (liveComposerGuidance) return liveComposerGuidance;
     if (taskStatus === 'awaiting_outcome' && !isTerminalReopenable) {
       return presentation.composerGuidance;
     }
@@ -494,7 +552,9 @@
         ? 'Send a message to reopen this task…'
         : blockReason
           ? blockReason
-          : 'Message this task…',
+          : liveComposerGuidance
+            ? 'Enter queues a follow-up · Ctrl+Enter injects live input…'
+            : 'Message this task…',
   );
 
   const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
@@ -557,7 +617,13 @@
   {/if}
 
   {#if composerNote}
-    <div class="composer-guidance" role="note">{composerNote}</div>
+    <div
+      class="composer-guidance"
+      role="note"
+      data-composer-guidance={blockReason ? 'blocked' : liveComposerGuidance ? 'live' : 'info'}
+    >
+      {composerNote}
+    </div>
   {/if}
 
   <!-- Layered input: highlight backdrop + transparent textarea (Cursor-style live chips). -->
@@ -675,22 +741,42 @@
         >
           <span class="codicon codicon-debug-stop"></span>
         </button>
-      {:else if canSend}
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 28px; height: 28px;"
-          onclick={send}
-          aria-label="Send"
-          use:tip={'Send'}
-        >
-          <span class="codicon codicon-send"></span>
-        </button>
-      {:else if (runtime === 'queued' || taskStatus === 'queued') && turnId}
-        <span class="task-muted text-xs">Queued turn is waiting to resume.</span>
+      {/if}
+      {#if canSend}
+        {#if !canCancel}
+          <button
+            type="button"
+            class="icon-btn"
+            style="width: 28px; height: 28px;"
+            onclick={send}
+            aria-label="Send"
+            use:tip={
+              mode === 'task' && (runtime === 'running' || taskStatus === 'running')
+                ? 'Enter queues a follow-up; Ctrl+Enter injects live input'
+                : isTerminalReopenable
+                  ? 'Send a message to reopen this task'
+                  : 'Send'
+            }
+          >
+            <span class="codicon codicon-send"></span>
+          </button>
+        {/if}
+        {#if mode === 'task' && (runtime === 'running' || taskStatus === 'running')}
+          <button
+            type="button"
+            class="icon-btn"
+            style="width: 28px; height: 28px;"
+            onclick={sendLiveInput}
+            aria-label="Inject live input"
+            use:tip={'Ctrl+Enter: inject live input (never queues)'}
+            data-testid="composer-live-inject"
+          >
+            <span class="codicon codicon-debug-line-by-line"></span>
+          </button>
+        {/if}
       {:else if (runtime === 'needs_recovery' || taskStatus === 'needs_recovery') && !turnId}
         <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
-      {:else if thread.running}
+      {:else if mode === 'draft' && thread.running}
         <button
           type="button"
           class="icon-btn"

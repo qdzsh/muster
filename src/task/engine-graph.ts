@@ -23,6 +23,7 @@ import type { TaskStore } from './store';
 import {
   createTask,
   cancelPendingTurn,
+  holdQueuedFollowUpsOnFailure,
   interruptTurn,
   registerAsk,
   stageDisposition,
@@ -132,7 +133,8 @@ export interface GraphEngineDeps {
   /** Independent hard cap on a bridge token's TTL. Defaults to MAX_BRIDGE_TOKEN_TTL_MS. */
   maxBridgeTokenTtlMs?: number;
   clock?: () => string;
-  liveRuns: Map<string, AbortController>;
+  /** Active in-process runs keyed by turnId. Handles expose abort + live-input context. */
+  liveRuns: Map<string, { controller: AbortController }>;
   pendingAskPromises: Map<string, { promise: Promise<Answers>; fingerprint: string }>;
   onScheduleTurn: (turnId: string) => void;
   leaseOwnerAlive: (turnId: string) => boolean;
@@ -450,7 +452,7 @@ export async function executeToolCommand(
 
       if (command.kind === 'interrupt_task') {
         if (liveTurn && deps.ownsLease(liveTurn.id)) {
-          deps.liveRuns.get(liveTurn.id)?.abort();
+          deps.liveRuns.get(liveTurn.id)?.controller.abort();
         }
         const commit = deps.store.commit((draft) => {
           const turn = liveTurn ? draft.turns[liveTurn.id] : undefined;
@@ -458,6 +460,7 @@ export async function executeToolCommand(
             const interrupted = interruptTurn(turn, { now });
             if (!interrupted.ok) return interrupted;
             draft.turns[turn.id] = interrupted.next;
+            holdQueuedFollowUpsOnFailure(draft, turn.taskId);
           }
           writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { interrupted: true } });
           return { ok: true };
@@ -483,7 +486,7 @@ export async function executeToolCommand(
           deps.writeCancelRequest(lt.id, 'cancel', ctx.turnId, command.opId);
           continue;
         }
-        if (lt && deps.ownsLease(lt.id)) deps.liveRuns.get(lt.id)?.abort();
+        if (lt && deps.ownsLease(lt.id)) deps.liveRuns.get(lt.id)?.controller.abort();
         deps.store.commit((draft) => {
           const task = draft.tasks[taskId];
           if (!task || isTerminalLifecycle(task.lifecycle)) return { ok: true };
@@ -695,7 +698,7 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
     if (!deps.ownsLease(turnId)) {
       continue;
     }
-    deps.liveRuns.get(turnId)?.abort();
+    deps.liveRuns.get(turnId)?.controller.abort();
     deps.store.commit((draft) => {
       const turn = draft.turns[turnId];
       if (!turn) {
@@ -704,7 +707,10 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
       }
       if (request.kind === 'interrupt') {
         const interrupted = interruptTurn(turn, { now });
-        if (interrupted.ok) draft.turns[turnId] = interrupted.next;
+        if (interrupted.ok) {
+          draft.turns[turnId] = interrupted.next;
+          holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+        }
       } else {
         const task = draft.tasks[turn.taskId];
         if (task) {
