@@ -398,14 +398,20 @@ function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[]
 }
 
 /**
- * MEM030: after the latest non-queued turn for a task failed/interrupted and
- * there is still a queued follow-up, do not auto-promote that queue until an
- * explicit resume/recovery path. Prevents an unrelated task's success from
- * thawing a frozen failure queue.
+ * MEM030: after the latest non-queued turn for a task failed/interrupted,
+ * do not auto-promote **pre-failure** FIFO follow-ups until explicit resume.
+ * Turns created at/after that settlement (Retry/Continue/auto-retry) are not
+ * frozen so they can start once capacity frees. Also prevents an unrelated
+ * task's success from thawing a frozen pre-failure queue.
  */
-function isTaskAutoFollowUpFrozen(file: TaskStoreFile, taskId: string): boolean {
+function isQueuedTurnAutoPromoteFrozen(
+  file: TaskStoreFile,
+  taskId: string,
+  candidateTurnId: string,
+): boolean {
   const turns = turnsForTask(file, taskId);
-  if (!turns.some((turn) => turn.status === 'queued')) return false;
+  const candidate = turns.find((turn) => turn.id === candidateTurnId);
+  if (!candidate || candidate.status !== 'queued') return false;
   if (turns.some((turn) => turn.status === 'running' || turn.status === 'waiting_user')) {
     return false;
   }
@@ -418,7 +424,15 @@ function isTaskAutoFollowUpFrozen(file: TaskStoreFile, taskId: string): boolean 
         b.id.localeCompare(a.id),
     )[0];
   if (!latestSettled) return false;
-  return latestSettled.status === 'failed' || latestSettled.status === 'interrupted';
+  if (latestSettled.status !== 'failed' && latestSettled.status !== 'interrupted') {
+    return false;
+  }
+  // Post-settlement recovery/retry turns may auto-promote when capacity frees.
+  const boundary = latestSettled.finishedAt ?? latestSettled.createdAt;
+  if (candidate.createdAt >= boundary) {
+    return false;
+  }
+  return true;
 }
 
 function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): string {
@@ -1775,9 +1789,9 @@ export class TaskEngine {
         }
         if (settledTaskId && turn.taskId === settledTaskId) {
           if (!allowSameTaskFollowUps) continue;
-        } else if (isTaskAutoFollowUpFrozen(file, turn.taskId)) {
-          // Unrelated settlement must not thaw another task frozen after
-          // failure/interrupt; explicit resumeQueuedTurn / recovery only.
+        } else if (isQueuedTurnAutoPromoteFrozen(file, turn.taskId, turn.id)) {
+          // Unrelated settlement must not thaw pre-failure follow-ups; post-
+          // settlement recovery/retry turns are not frozen (see helper).
           continue;
         }
         if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
