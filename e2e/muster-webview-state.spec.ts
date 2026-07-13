@@ -127,7 +127,16 @@ async function postedMessages(page: Page) {
 }
 
 async function expectPostedMessage(page: Page, expected: unknown) {
-  await expect.poll(async () => postedMessages(page)).toContainEqual(expected);
+  // Partial match: Phase C send messages include ephemeral clientRequestId.
+  await expect
+    .poll(async () => postedMessages(page))
+    .toEqual(
+      expect.arrayContaining([
+        typeof expected === 'object' && expected !== null
+          ? expect.objectContaining(expected as Record<string, unknown>)
+          : expected,
+      ]),
+    );
 }
 
 async function dispatchFileDrag(page: Page, type: 'dragover' | 'drop', mime: string, value: string) {
@@ -567,42 +576,22 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    await expect(page.locator('[data-turn-activity="failed_turn"]').getByText(/Could not finish/i)).toBeVisible();
-    await expect(page.locator('.task-action-panel--danger').getByText('No retryable turn is available for this task.')).toBeVisible();
-    await expect(page.locator('.task-action-panel--danger').getByText(/Task lifecycle remains/i)).toBeVisible();
-    await expect(page.getByText('Recovery actions need a retryable turn.')).toBeVisible();
-    await expectButtonDisabledAttribute(page, 'Retry failed turn');
-    await expectButtonDisabledAttribute(page, 'Continue task');
-    await page.getByPlaceholder('What should the agent do differently?').fill('Retry without a turn.');
-    await page.getByPlaceholder('Message to queue as the next turn...').fill('Continue without a turn.');
-    await expectButtonDisabledAttribute(page, 'Retry failed turn');
-    await expectButtonDisabledAttribute(page, 'Continue task');
-
-    await postSnapshot(page, {
-      type: 'snapshot',
-      rootTasks: [task({ id: 'task-recovery', goal: 'Recover failed analysis', viewStatus: 'needs_recovery' })],
-      focusedTaskId: 'task-recovery',
-      subtree: [task({ id: 'task-recovery', goal: 'Recover failed analysis', viewStatus: 'needs_recovery' })],
-      transcript: [{ id: 'msg-2b', kind: 'error', content: { message: 'Tool timeout.' } }],
-      activeTurnId: 'turn-retryable',
-      storeRevision: 41,
-    });
-
-    await expect(page.locator('.task-action-panel--danger').getByText('No retryable turn is available for this task.')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Retry failed turn' })).toBeEnabled();
+    await expect(page.locator('.turn-activity-bar[data-turn-activity="failed_turn"]')).toBeVisible();
+    await expect(page.locator('.task-action-panel--danger').getByText(/^Could not finish$/)).toBeVisible();
+    // Host currentTurnActivity carries turnId even without activeTurnId projection.
+    await expect(page.getByRole('button', { name: 'Try again' })).toBeEnabled();
     await page.getByPlaceholder('What should the agent do differently?').fill('Use a smaller batch and retry.');
-    await expect(page.getByRole('button', { name: 'Retry failed turn' })).toBeEnabled();
-    await page.getByRole('button', { name: 'Retry failed turn' }).click();
+    await page.getByRole('button', { name: 'Try again' }).click();
     await expectPostedMessage(page, {
       type: 'retryTurn',
       taskId: 'task-recovery',
-      turnId: 'turn-retryable',
+      turnId: 'turn-fixture',
       instruction: 'Use a smaller batch and retry.',
     });
 
     await page.getByPlaceholder('Message to queue as the next turn...').fill('Continue after documenting the failure.');
-    await expect(page.getByRole('button', { name: 'Continue task' })).toBeEnabled();
-    await page.getByRole('button', { name: 'Continue task' }).click();
+    await expect(page.getByRole('button', { name: 'Continue' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Continue' }).click();
     await expectPostedMessage(page, {
       type: 'continueTask',
       taskId: 'task-recovery',
@@ -765,7 +754,7 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.locator('[data-turn-activity="waiting_you"]').getByText(/Waiting for you/i)).toBeVisible();
     await expect(page.getByText('Agent question')).toBeVisible();
     await expect(page.getByText('Which model should continue?')).toBeVisible();
-    await expect(page.locator('.composer-guidance').getByText('Answer the pending task question above to continue.')).toBeVisible();
+    await expect(page.locator('.composer-guidance').getByText('Answer above to continue.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
     // Live turn still open — Stop this turn remains available.
     await expect(page.getByRole('button', { name: 'Stop this turn' })).toBeVisible();
