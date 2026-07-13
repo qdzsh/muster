@@ -336,7 +336,7 @@ describe('TaskEngine', () => {
     expect(store.getTask('task-1')?.committedSessionId).toBeUndefined();
   });
 
-  it('eagerly queues a FIFO follow-up turn while running and rejects terminal send', async () => {
+  it('eagerly queues a FIFO follow-up turn while running and continues on the open task', async () => {
     const { store } = makeTempStore();
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
