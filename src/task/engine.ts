@@ -44,6 +44,7 @@ import {
   isTerminalLifecycle,
   prepareDeleteQueuedTurn,
   prepareEditQueuedTurn,
+  holdQueuedFollowUpsOnFailure,
   reopenTask,
   setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
@@ -397,15 +398,6 @@ function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[]
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 }
 
-/** MEM030: durable hold set on queued turns present at failed/interrupted settle. */
-function holdQueuedFollowUpsOnFailure(draft: TaskStoreFile, taskId: string): void {
-  for (const turn of turnsForTask(draft, taskId)) {
-    if (turn.status !== 'queued') continue;
-    if (turn.holdAutoPromote) continue;
-    draft.turns[turn.id] = { ...turn, holdAutoPromote: true };
-  }
-}
-
 function isQueuedTurnAutoPromoteFrozen(
   file: TaskStoreFile,
   taskId: string,
@@ -551,6 +543,7 @@ export class TaskEngine {
         const interrupted = interruptTurn(turn, { now });
         if (!interrupted.ok) return interrupted;
         draft.turns[ref.turnId] = interrupted.next;
+        holdQueuedFollowUpsOnFailure(draft, turn.taskId);
       }
       return { ok: true };
     });
@@ -1520,6 +1513,7 @@ export class TaskEngine {
           return result;
         }
         draft.turns[turn.id] = result.next;
+        holdQueuedFollowUpsOnFailure(draft, draftTurn.taskId);
         return { ok: true };
       });
       this.acceptedOpIds.delete(turn.id);

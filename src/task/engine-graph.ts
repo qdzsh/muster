@@ -23,6 +23,7 @@ import type { TaskStore } from './store';
 import {
   createTask,
   cancelPendingTurn,
+  holdQueuedFollowUpsOnFailure,
   interruptTurn,
   registerAsk,
   stageDisposition,
@@ -459,6 +460,7 @@ export async function executeToolCommand(
             const interrupted = interruptTurn(turn, { now });
             if (!interrupted.ok) return interrupted;
             draft.turns[turn.id] = interrupted.next;
+            holdQueuedFollowUpsOnFailure(draft, turn.taskId);
           }
           writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { interrupted: true } });
           return { ok: true };
@@ -705,7 +707,10 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
       }
       if (request.kind === 'interrupt') {
         const interrupted = interruptTurn(turn, { now });
-        if (interrupted.ok) draft.turns[turnId] = interrupted.next;
+        if (interrupted.ok) {
+          draft.turns[turnId] = interrupted.next;
+          holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+        }
       } else {
         const task = draft.tasks[turn.taskId];
         if (task) {

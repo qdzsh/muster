@@ -989,3 +989,20 @@ export function stageDisposition(
 
   return { ok: false, reason: 'disposition already staged with a different opId' };
 }
+
+/**
+ * MEM030: mark already-queued follow-ups so they are not auto-promoted after a
+ * failed/interrupted live settlement. Call inside the same commit that settles
+ * the live turn, before creating post-settlement retry/recovery turns.
+ */
+export function holdQueuedFollowUpsOnFailure(
+  draft: { turns: Record<string, TaskTurn> },
+  taskId: string,
+): void {
+  for (const turn of Object.values(draft.turns)) {
+    if (turn.taskId !== taskId || turn.status !== 'queued') continue;
+    if (turn.holdAutoPromote) continue;
+    draft.turns[turn.id] = { ...turn, holdAutoPromote: true };
+  }
+}
+
