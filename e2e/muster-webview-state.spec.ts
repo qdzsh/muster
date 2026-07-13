@@ -1001,7 +1001,9 @@ test.describe('Muster webview host state smoke', () => {
     await expect(
       page.locator('.composer-guidance').getByText(/Enter queues a follow-up turn/i),
     ).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Inject live input' })).toBeVisible();
+    const liveInject = page.getByTestId('composer-live-inject');
+    await expect(liveInject).toBeVisible();
+    await expect(liveInject).toHaveAttribute('aria-label', 'Interrupt and send');
 
     const composer = page.getByPlaceholder(/Enter queues a follow-up/i);
     await expect(composer).toBeEnabled();
@@ -1044,9 +1046,9 @@ test.describe('Muster webview host state smoke', () => {
       ),
     ).toHaveLength(0);
 
-    // Explicit inject control uses the same live-input path.
+    // Explicit interrupt-and-send control uses the same live-input path.
     await composer.fill('Inject via button');
-    await page.getByRole('button', { name: 'Inject live input' }).click();
+    await liveInject.click();
     await expectPostedMessage(page, {
       type: 'sendLiveInput',
       taskId: 'task-live',
@@ -1067,7 +1069,7 @@ test.describe('Muster webview host state smoke', () => {
 
     const composer = page.getByRole('textbox').first();
     await expect(composer).toBeEnabled();
-    await expect(page.getByRole('button', { name: 'Inject live input' })).toHaveCount(0);
+    await expect(page.getByTestId('composer-live-inject')).toHaveCount(0);
 
     await composer.fill('Send while idle via chord');
     await composer.press('Control+Enter');
