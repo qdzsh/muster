@@ -188,6 +188,11 @@ export interface MusterTask {
   /** Who sealed lifecycle (user or coordinator). Required on every terminal seal going forward. */
   sealedBy?: TaskSealedBy;
   /**
+   * Parent-orchestration seal policy (primarily on roots; schema ≥ 5).
+   * Default at root creation: parent_may_seal_direct.
+   */
+  childOrchestrationSeal?: 'parent_may_seal_direct' | 'propose_only';
+  /**
    * Optional cross-runtime handoff state (schema-compatible: absent on legacy tasks).
    * Owned by the TaskHandoff aggregate; never projected as ordinary TaskMessage chat.
    * Malformed records are stripped on load (fail closed) without quarantining the store.
@@ -448,6 +453,8 @@ export interface CancelRequest {
   by: string;
   opId: string;
   at: string;
+  /** Optional durable sealer for remote cancel settlement (W4). */
+  sealedBy?: TaskSealedBy;
 }
 
 export interface OperationLedgerEntry {

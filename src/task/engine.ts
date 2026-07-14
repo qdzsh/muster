@@ -565,10 +565,16 @@ export class TaskEngine {
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
       leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
       ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
-      writeCancelRequest: (turnId, kind, by, opId) => {
+      writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
         this.store.commit((draft) => {
           draft.cancelRequests = draft.cancelRequests ?? {};
-          draft.cancelRequests[turnId] = { kind, by, opId, at: nowIso(this.clock) };
+          draft.cancelRequests[turnId] = {
+            kind,
+            by,
+            opId,
+            at: nowIso(this.clock),
+            ...(sealedBy ? { sealedBy } : {}),
+          };
           return { ok: true };
         });
       },
@@ -2350,7 +2356,7 @@ export class TaskEngine {
         now,
         result: options?.result,
         error: options?.error,
-        sealedBy: 'user',
+        sealedBy: { kind: 'user' },
       });
       if (!result.ok) {
         return result;
@@ -2449,7 +2455,7 @@ export class TaskEngine {
         }
         const result = transitionSetTaskLifecycle(task, 'skipped', {
           now,
-          sealedBy: 'user',
+          sealedBy: { kind: 'user' },
         });
         if (!result.ok) {
           return result;
@@ -2535,7 +2541,11 @@ export class TaskEngine {
           };
           continue;
         }
-        const result = transitionCancelTask(task, { liveTurn: currentLive, now });
+        const result = transitionCancelTask(task, {
+          liveTurn: currentLive,
+          now,
+          sealedBy: { kind: 'user' },
+        });
         if (!result.ok) {
           return result;
         }
@@ -3014,6 +3024,11 @@ export class TaskEngine {
         const terminal = applyDependencyTerminal(task, live, outcome, {
           now,
           error: outcome === 'failed' ? 'dependency unsatisfied' : undefined,
+          sealedBy: {
+            kind: 'coordinator',
+            taskId: task.parentId ?? task.id,
+            mode: 'dependency_policy',
+          },
         });
         if (terminal.ok) {
           draft.tasks[task.id] = terminal.next.task;
@@ -3851,7 +3866,29 @@ export class TaskEngine {
 
         const observed = observedSessionId ?? turn.observedSessionId;
         const withObserved = { ...turn, observedSessionId: observed };
-        const result = applySuccessfulTurn(task, withObserved, { now });
+        // Root owns childOrchestrationSeal policy (W4).
+        let rootId = task.id;
+        let walk: string | null = task.parentId;
+        const seen = new Set<string>();
+        while (walk && !seen.has(walk)) {
+          seen.add(walk);
+          rootId = walk;
+          walk = draft.tasks[walk]?.parentId ?? null;
+        }
+        const rootPolicy = draft.tasks[rootId]?.childOrchestrationSeal;
+        const result = applySuccessfulTurn(task, withObserved, {
+          now,
+          rootChildOrchestrationSeal: rootPolicy,
+          sealedBy:
+            task.parentId !== null
+              ? {
+                  kind: 'coordinator',
+                  taskId: task.parentId,
+                  turnId,
+                  mode: 'parent_may_seal_direct',
+                }
+              : undefined,
+        });
         if (!result.ok) {
           return result;
         }

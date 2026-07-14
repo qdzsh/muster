@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  applyDependencyTerminal,
   applyFailedTurn,
   applySuccessfulTurn,
   cancelTask,
@@ -380,6 +381,110 @@ describe('applySuccessfulTurn', () => {
         revision: 1,
         summary: 'done',
       });
+      expect(result.next.task.sealedBy).toEqual({
+        kind: 'coordinator',
+        taskId: 'root-1',
+        turnId: 't1',
+        mode: 'parent_may_seal_direct',
+      });
+    }
+  });
+
+  it('idle disposition sets missing_disposition attention without sealing', () => {
+    const result = applySuccessfulTurn(
+      baseTask({ id: 'child-1', parentId: 'root-1' }),
+      { ...running, taskId: 'child-1', disposition: { kind: 'idle' } },
+      { now: NOW },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.attention?.code).toBe('missing_disposition');
+      expect(result.next.task.sealedBy).toBeUndefined();
+    }
+  });
+
+  it('propose_only root policy keeps child open with outcome proposal', () => {
+    const staged = {
+      ...running,
+      taskId: 'child-1',
+      disposition: { kind: 'complete' as const, result: 'done' },
+    };
+    const result = applySuccessfulTurn(
+      baseTask({ id: 'child-1', parentId: 'root-1' }),
+      staged,
+      { now: NOW, rootChildOrchestrationSeal: 'propose_only' },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.outcomeProposal).toMatchObject({ kind: 'complete', result: 'done' });
+      expect(result.next.task.sealedBy).toBeUndefined();
+    }
+  });
+
+  it('dependency fail sets sealedBy coordinator dependency_policy', () => {
+    const result = applyDependencyTerminal(
+      baseTask({ id: 'impl', parentId: 'root-1' }),
+      undefined,
+      'failed',
+      { now: NOW },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.lifecycle).toBe('failed');
+      expect(result.next.task.sealedBy).toEqual({
+        kind: 'coordinator',
+        taskId: 'root-1',
+        mode: 'dependency_policy',
+      });
+    }
+  });
+
+  it('dependency skip and cancelTask set sealedBy', () => {
+    const skip = applyDependencyTerminal(
+      baseTask({ id: 'impl', parentId: 'root-1' }),
+      undefined,
+      'skipped',
+      { now: NOW },
+    );
+    expect(skip.ok).toBe(true);
+    if (skip.ok) {
+      expect(skip.next.task.lifecycle).toBe('skipped');
+      expect(skip.next.task.sealedBy?.kind).toBe('coordinator');
+      expect(skip.next.task.sealedBy && 'mode' in skip.next.task.sealedBy
+        ? skip.next.task.sealedBy.mode
+        : undefined).toBe('dependency_policy');
+    }
+    const cancelled = cancelTask(baseTask({ id: 'c1', parentId: 'root-1' }), {
+      now: NOW,
+      sealedBy: { kind: 'user' },
+    });
+    expect(cancelled.ok).toBe(true);
+    if (cancelled.ok) {
+      expect(cancelled.next.task.sealedBy).toEqual({ kind: 'user' });
+    }
+  });
+
+  it('non-root fail disposition seals with coordinator sealedBy', () => {
+    const staged = {
+      ...running,
+      taskId: 'child-1',
+      disposition: { kind: 'fail' as const, error: 'boom' },
+    };
+    const result = applySuccessfulTurn(
+      baseTask({ id: 'child-1', parentId: 'root-1' }),
+      staged,
+      { now: NOW },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.lifecycle).toBe('failed');
+      expect(result.next.task.sealedBy).toMatchObject({
+        kind: 'coordinator',
+        taskId: 'root-1',
+        mode: 'parent_may_seal_direct',
+      });
     }
   });
 
@@ -522,7 +627,11 @@ describe('applyFailedTurn', () => {
   });
 
   it('setTaskLifecycle seals succeeded for user', () => {
-    const result = setTaskLifecycle(baseTask(), 'succeeded', { now: NOW, result: 'shipped' });
+    const result = setTaskLifecycle(baseTask(), 'succeeded', {
+      now: NOW,
+      result: 'shipped',
+      sealedBy: { kind: 'user' },
+    });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.lifecycle).toBe('succeeded');
@@ -532,6 +641,7 @@ describe('applyFailedTurn', () => {
         revision: 1,
         summary: 'shipped',
       });
+      expect(result.next.sealedBy).toEqual({ kind: 'user' });
     }
   });
 

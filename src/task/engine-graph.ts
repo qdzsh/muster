@@ -141,7 +141,13 @@ export interface GraphEngineDeps {
   onScheduleTurn: (turnId: string) => void;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
-  writeCancelRequest: (turnId: string, kind: 'interrupt' | 'cancel', by: string, opId: string) => void;
+  writeCancelRequest: (
+    turnId: string,
+    kind: 'interrupt' | 'cancel',
+    by: string,
+    opId: string,
+    sealedBy?: import('./types').TaskSealedBy,
+  ) => void;
   onTurnSettled?: (turnId: string) => void;
 }
 
@@ -628,22 +634,18 @@ export async function executeToolCommand(
         liveTurn &&
         deps.leaseOwnerAlive(liveTurn.id) &&
         !deps.ownsLease(liveTurn.id);
-      if (remoteLeased) {
-        deps.writeCancelRequest(
-          liveTurn.id,
-          command.kind === 'interrupt_task' ? 'interrupt' : 'cancel',
-          ctx.turnId,
-          command.opId,
-        );
-        const result: OpResult = { ok: true, data: { requested: true } };
-        deps.store.commit((draft) => {
-          writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
-          return { ok: true };
-        });
-        return { ok: true, result: result.data };
-      }
 
+      // interrupt only: remote early-return (no subtree). cancel always cascades.
       if (command.kind === 'interrupt_task') {
+        if (remoteLeased) {
+          deps.writeCancelRequest(liveTurn!.id, 'interrupt', ctx.callerTaskId, command.opId);
+          const result: OpResult = { ok: true, data: { requested: true } };
+          deps.store.commit((draft) => {
+            writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
+            return { ok: true };
+          });
+          return { ok: true, result: result.data };
+        }
         if (liveTurn && deps.ownsLease(liveTurn.id)) {
           deps.liveRuns.get(liveTurn.id)?.controller.abort();
         }
@@ -655,7 +657,10 @@ export async function executeToolCommand(
             draft.turns[turn.id] = interrupted.next;
             holdQueuedFollowUpsOnFailure(draft, turn.taskId);
           }
-          writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { interrupted: true } });
+          writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+            ok: true,
+            data: { interrupted: true },
+          });
           return { ok: true };
         });
         if (!commit.ok) return { ok: false, error: commit.detail ?? commit.reason };
@@ -663,6 +668,12 @@ export async function executeToolCommand(
         return { ok: true, result: { interrupted: true } };
       }
 
+      const coordinatorSeal = {
+        kind: 'coordinator' as const,
+        taskId: ctx.callerTaskId,
+        turnId: ctx.turnId,
+        mode: 'cancel_task',
+      };
       const ids = [command.childId, ...descendantIds(deps.store.getFile(), command.childId)].reverse();
       for (const taskId of ids) {
         const pendingTurns = turnsForTask(deps.store.getFile(), taskId).filter(
@@ -671,12 +682,9 @@ export async function executeToolCommand(
         const lt = pendingTurns.find(
           (t) => t.status === 'running' || t.status === 'waiting_user',
         );
-        if (
-          lt &&
-          deps.leaseOwnerAlive(lt.id) &&
-          !deps.ownsLease(lt.id)
-        ) {
-          deps.writeCancelRequest(lt.id, 'cancel', ctx.turnId, command.opId);
+        if (lt && deps.leaseOwnerAlive(lt.id) && !deps.ownsLease(lt.id)) {
+          // Remote owner will seal task + settle turns atomically via processCancelRequests.
+          deps.writeCancelRequest(lt.id, 'cancel', ctx.callerTaskId, command.opId, coordinatorSeal);
           continue;
         }
         if (lt && deps.ownsLease(lt.id)) deps.liveRuns.get(lt.id)?.controller.abort();
@@ -689,7 +697,11 @@ export async function executeToolCommand(
           const currentLive = currentPending.find(
             (t) => t.status === 'running' || t.status === 'waiting_user',
           );
-          const cancelled = transitionCancelTask(task, { liveTurn: currentLive, now });
+          const cancelled = transitionCancelTask(task, {
+            liveTurn: currentLive,
+            now,
+            sealedBy: coordinatorSeal,
+          });
           if (!cancelled.ok) return cancelled;
           draft.tasks[taskId] = cancelled.next.task;
           if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
@@ -704,7 +716,10 @@ export async function executeToolCommand(
         if (lt) cleanupTurnResources(deps, lt.id);
       }
       deps.store.commit((draft) => {
-        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { cancelled: command.childId } });
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: { cancelled: command.childId },
+        });
         return { ok: true };
       });
       return { ok: true, result: { cancelled: command.childId } };
@@ -857,7 +872,19 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
           const pendingTurns = turnsForTask(draft, task.id).filter(
             (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
           );
-          const cancelled = transitionCancelTask(task, { liveTurn: turn, now });
+          const cancelled = transitionCancelTask(task, {
+            liveTurn: turn,
+            now,
+            sealedBy:
+              request.sealedBy ??
+              (request.by === 'engine' || request.by === 'user'
+                ? { kind: 'user' }
+                : {
+                    kind: 'coordinator',
+                    taskId: request.by,
+                    mode: 'cancel_task',
+                  }),
+          });
           if (cancelled.ok) {
             draft.tasks[task.id] = cancelled.next.task;
             if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;

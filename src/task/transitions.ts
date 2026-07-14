@@ -12,6 +12,7 @@ import type {
   TaskMessage,
   TaskReleaseState,
   TaskRole,
+  TaskSealedBy,
   TaskTurn,
   TurnDisposition,
   TurnFailureClass,
@@ -19,6 +20,22 @@ import type {
   TurnStatus,
   TurnTrigger,
 } from './types';
+
+/** Named parent-orchestration policy for child auto-seal (W4). */
+export type ChildOrchestrationSealMode = 'parent_may_seal_direct' | 'propose_only';
+
+/**
+ * Whether a child may be auto-sealed by host parent-orchestration.
+ * Policy is stored on the **root** (passed as rootPolicy); children are non-root.
+ */
+export function mayParentSealDirect(
+  task: MusterTask,
+  rootPolicy?: ChildOrchestrationSealMode,
+): boolean {
+  if (task.parentId === null) return false;
+  const mode = rootPolicy ?? 'parent_may_seal_direct';
+  return mode === 'parent_may_seal_direct';
+}
 
 export type Effect =
   | { kind: 'commitSession' }
@@ -269,6 +286,10 @@ export function createTask(
     executionPolicy: { ...input.executionPolicy },
     brief: input.brief ?? synthesizeBriefFromGoal(input.goal, input.description),
     releaseState: input.releaseState ?? 'draft',
+    // Workspace default on roots: parent may seal direct children.
+    ...(input.parentId === null
+      ? { childOrchestrationSeal: 'parent_may_seal_direct' as const }
+      : {}),
     ...(input.inputBindings ? { inputBindings: [...input.inputBindings] } : {}),
     ...(input.claimsGit !== undefined ? { claimsGit: input.claimsGit } : {}),
     revision: 0,
@@ -334,7 +355,16 @@ export function submitAnswer(turn: TaskTurn): TransitionResult<TaskTurn> {
 export function applySuccessfulTurn(
   task: MusterTask,
   turn: TaskTurn,
-  options: { now: string },
+  options: {
+    now: string;
+    /**
+     * Coordinator sealer for eligible direct-child auto-seal.
+     * When omitted, host uses parentId with mode parent_may_seal_direct.
+     */
+    sealedBy?: TaskSealedBy;
+    /** Root's childOrchestrationSeal policy (required for correct propose_only). */
+    rootChildOrchestrationSeal?: ChildOrchestrationSealMode;
+  },
 ): TransitionResult<{ task: MusterTask; turn: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is terminal' };
@@ -360,9 +390,20 @@ export function applySuccessfulTurn(
 
   const disposition = turn.disposition;
   if (!disposition || disposition.kind === 'idle') {
+    // CLI success without disposition: no seal; raise attention (W4).
     return {
       ok: true,
-      next: { task: bumpTask(task, options.now, {}), turn: succeededTurn },
+      next: {
+        task: bumpTask(task, options.now, {
+          attention: {
+            code: 'missing_disposition',
+            message: 'turn succeeded without complete/fail disposition',
+            at: options.now,
+            sourceTurnId: turn.id,
+          },
+        }),
+        turn: succeededTurn,
+      },
       effects,
     };
   }
@@ -372,8 +413,8 @@ export function applySuccessfulTurn(
       // Persist structured TaskResultV1 on propose and seal (W1 dataflow).
       const taskResult = buildTaskResultFromSummary(disposition.result, task.taskResult);
       // Root tasks: human-gated — propose only; lifecycle stays open (TASK-MANAGEMENT §5.3).
-      // Non-root: seal for orchestration / wait barriers.
-      if (task.parentId === null) {
+      // Eligible direct children: host parent-orchestration seals with sealedBy.coordinator.
+      if (!mayParentSealDirect(task, options.rootChildOrchestrationSeal)) {
         return {
           ok: true,
           next: {
@@ -392,6 +433,12 @@ export function applySuccessfulTurn(
           effects,
         };
       }
+      const sealedBy: TaskSealedBy = options.sealedBy ?? {
+        kind: 'coordinator',
+        taskId: task.parentId!,
+        turnId: turn.id,
+        mode: 'parent_may_seal_direct',
+      };
       return {
         ok: true,
         next: {
@@ -401,6 +448,7 @@ export function applySuccessfulTurn(
             result: taskResult.summary,
             finishedAt: options.now,
             outcomeProposal: undefined,
+            sealedBy,
           }),
           turn: succeededTurn,
         },
@@ -408,7 +456,7 @@ export function applySuccessfulTurn(
       };
     }
     case 'fail':
-      if (task.parentId === null) {
+      if (!mayParentSealDirect(task, options.rootChildOrchestrationSeal)) {
         return {
           ok: true,
           next: {
@@ -425,19 +473,28 @@ export function applySuccessfulTurn(
           effects,
         };
       }
-      return {
-        ok: true,
-        next: {
-          task: bumpTask(task, options.now, {
-            lifecycle: 'failed',
-            error: disposition.error,
-            finishedAt: options.now,
-            outcomeProposal: undefined,
-          }),
-          turn: succeededTurn,
-        },
-        effects,
-      };
+      {
+        const sealedBy: TaskSealedBy = options.sealedBy ?? {
+          kind: 'coordinator',
+          taskId: task.parentId!,
+          turnId: turn.id,
+          mode: 'parent_may_seal_direct',
+        };
+        return {
+          ok: true,
+          next: {
+            task: bumpTask(task, options.now, {
+              lifecycle: 'failed',
+              error: disposition.error,
+              finishedAt: options.now,
+              outcomeProposal: undefined,
+              sealedBy,
+            }),
+            turn: succeededTurn,
+          },
+          effects,
+        };
+      }
     case 'wait_tasks':
       return {
         ok: true,
@@ -532,10 +589,12 @@ export function setTaskLifecycle(
     now: string;
     result?: string;
     error?: string;
-    /** Who applied the change (audit; optional). */
-    sealedBy?: 'user' | 'coordinator';
+    /** Required on every terminal seal (W4). */
+    sealedBy?: TaskSealedBy;
   },
 ): TransitionResult<MusterTask> {
+  const sealedBy = options.sealedBy ?? { kind: 'user' as const };
+
   if (task.lifecycle === lifecycle) {
     const sameSucceededPatch: Partial<MusterTask> = { outcomeProposal: undefined };
     if (lifecycle === 'succeeded' && options.result !== undefined) {
@@ -545,6 +604,9 @@ export function setTaskLifecycle(
     }
     if (lifecycle === 'failed' && options.error !== undefined) {
       sameSucceededPatch.error = options.error;
+    }
+    if (isTerminalLifecycle(lifecycle)) {
+      sameSucceededPatch.sealedBy = sealedBy;
     }
     return {
       ok: true,
@@ -569,6 +631,7 @@ export function setTaskLifecycle(
       lifecycle: 'succeeded',
       finishedAt: options.now,
       outcomeProposal: undefined,
+      sealedBy,
     };
     // Only write TaskResultV1 when a real summary exists — empty string would
     // incorrectly satisfy required inputBindings (W1 / codex-impl-review).
@@ -594,6 +657,7 @@ export function setTaskLifecycle(
         error: options.error ?? fromProposal ?? task.error,
         finishedAt: options.now,
         outcomeProposal: undefined,
+        sealedBy,
       }),
       effects: [{ kind: 'emitUpdate' }],
     };
@@ -606,6 +670,7 @@ export function setTaskLifecycle(
         lifecycle,
         finishedAt: options.now,
         outcomeProposal: undefined,
+        sealedBy,
       }),
       effects: [{ kind: 'emitUpdate' }],
     };
@@ -816,15 +881,21 @@ export function applyDependencyTerminal(
   task: MusterTask,
   pendingTurn: TaskTurn | undefined,
   outcome: 'failed' | 'skipped',
-  options: { now: string; error?: string },
+  options: { now: string; error?: string; sealedBy?: TaskSealedBy },
 ): TransitionResult<{ task: MusterTask; turn?: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is already terminal' };
   }
 
+  const sealedBy: TaskSealedBy = options.sealedBy ?? {
+    kind: 'coordinator',
+    taskId: task.parentId ?? task.id,
+    mode: 'dependency_policy',
+  };
   const terminalTask = bumpTask(task, options.now, {
     lifecycle: outcome,
     finishedAt: options.now,
+    sealedBy,
     ...(outcome === 'failed' ? { error: options.error ?? 'dependency unsatisfied' } : {}),
   });
 
@@ -852,7 +923,7 @@ export function applyDependencyTerminal(
 
 export function cancelTask(
   task: MusterTask,
-  options: { liveTurn?: TaskTurn; now: string },
+  options: { liveTurn?: TaskTurn; now: string; sealedBy?: TaskSealedBy },
 ): TransitionResult<{ task: MusterTask; turn?: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is already terminal' };
@@ -880,9 +951,11 @@ export function cancelTask(
     effects.push({ kind: 'cancelProcess' });
   }
 
+  const sealedBy: TaskSealedBy = options.sealedBy ?? { kind: 'user' };
   const cancelledTask = bumpTask(task, options.now, {
     lifecycle: 'cancelled',
     finishedAt: options.now,
+    sealedBy,
   });
 
   return {
