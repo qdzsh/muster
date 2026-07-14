@@ -801,17 +801,24 @@ tools.
 
 | Tool | Caller | Purpose |
 |------|--------|---------|
-| `create_task` | Coordinator | Create a direct child without starting it |
-| `delegate_task` | Coordinator | Atomically create a direct child and queue its first turn |
-| `start_task` | Coordinator | Queue the first turn of an existing direct child |
+| `create_task` | Coordinator | Create a **draft** direct child (no first turn; not scheduler-eligible) |
+| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent |
+| `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents |
+| `start_task` | **Host / recovery only** | Not in coordinator MCP `allowedActions`; rejects draft |
 | `interrupt_task` | Coordinator | Interrupt an active direct child turn |
-| `cancel_task` | Coordinator | Request cancel of a direct child (host may cascade per policy) |
-| `wait_for_tasks` | Coordinator | Stage the caller turn's explicit child wait set |
-| `get_task_status` | Coordinator | Read an authorized subtree summary (lifecycle **and** runtime activity) |
+| `cancel_task` | Coordinator | Request cancel of a direct child (host may cascade per policy); persists `sealedBy` |
+| `wait_for_tasks` | Coordinator | Stage the caller turn's explicit child wait set (`wakeOn` default: terminal + attention) |
+| `get_task_status` | Coordinator | Subtree summary: lifecycle, `releaseState`, **readiness**, attention, result.summary |
 | `complete_task` | Any task | Stage successful completion; **seal or propose** per outcome mode + role (§4.1.1) |
 | `fail_task` | Any task | Stage failure; seal or propose per mode + role |
 | `report_progress` | Any task | Update optional progress metadata |
 | `ask_user` | Any task | Block the caller's live turn for structured user input |
+
+**Happy path (multi-node graph):** `create_task*` (draft) → `release_tasks` → `wait_for_tasks`.  
+Coordinator does **not** start CLI processes via `start_task`.
+
+**Dataflow:** `inputBindings` + `TaskResultV1` (`summary` only v1); durable pin on turn before dispatch.  
+**Ordering** still uses `dependencies` separately.
 
 Tool names describe requested host actions. The MCP response confirms the host
 **accepted the staging** (and, when mode allows, that a seal will apply on
@@ -1226,6 +1233,20 @@ the webview status menu uses `setTaskLifecycle` only.
 - [ ] Make task flow the default
 - [ ] Remove legacy flat session path
 - [ ] Add retention, archival, and recovery UI
+
+### Phase F — Task orchestration auto-run (implemented)
+
+Plan: [`plans/task-orchestration-auto-run.md`](plans/task-orchestration-auto-run.md).
+
+- [x] W1 — `TaskResultV1`, `inputBindings`, durable pin before dispatch
+- [x] W2 — `TaskBriefV1`, prompt compiler, schema v5 migrate (`releaseState` + brief)
+- [x] W3 — Draft create, atomic `release_tasks`, first-turn intents, `start_task` lockdown
+- [x] W4 — `sealedBy` on all terminal paths; root `childOrchestrationSeal` policy
+- [x] W5 — Shared readiness evaluator + `rescanSchedulableTurns`
+- [x] W6 — Attention wake on `wait_for_tasks` (`wakeOn`, suspend phase)
+- [x] W7 — Shared-cwd writePaths / git mutex at promote
+- [x] W8 — Credential TTL ≥ turnTimeoutMs (hard 2h cap)
+- [x] W9 — Workspace trust gate + safe reload auto-resume for released never-dispatched turns
 
 ---
 
