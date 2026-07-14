@@ -596,6 +596,23 @@ Shared tool path: during a live turn the agent calls `complete_task` /
 `fail_task` / skip tools. The engine **stages** a disposition, then on
 `turnCompleted` either **proposes** or **seals** according to mode and role.
 
+**Parent seal MCP (`set_task_lifecycle`):** when a **direct child** stays open
+without staging disposition (e.g. agent omitted `complete_task`), a coordinator
+with the `cancel_child` capability may seal that child via
+`set_task_lifecycle`:
+
+| Lifecycle | Scope | Notes |
+|-----------|--------|--------|
+| `succeeded` / `failed` | **Target child only** | Requires `result` / `error`; `sealedBy: { kind:'coordinator', mode:'parent_seal' }` |
+| `cancelled` / `skipped` | **Subtree cascade** | Same class as host cancel/skip (unfinished descendants) |
+| Compatible terminal replay | No-op | Exact payload equality; does **not** rewrite `sealedBy` / revision |
+| Incompatible terminal | Error `already_terminal` | No overwrite |
+
+Root policy: `mayParentSealDirect` / `childOrchestrationSeal`. Under
+`propose_only`, parent seal is rejected. Under default
+`parent_may_seal_direct`, it is allowed. Sealing the **root** via MCP is not
+supported in v1 (user/host only).
+
 #### 5.3.1 Supervised path (`user_confirm` — default)
 
 Proposal / approval: the coordinator asserts “I think we’re done”; the **user**
@@ -801,14 +818,16 @@ tools.
 
 | Tool | Caller | Purpose |
 |------|--------|---------|
-| `create_task` | Coordinator | Create a **draft** direct child (no first turn; not scheduler-eligible). Args: `goal`, `backend`, optional `model` (ACP model id), `role`, `dependencies`, `executionPolicy` |
-| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same args as `create_task`, including optional `model`) |
+| `create_task` | Coordinator | Create a **draft** direct child (no first turn). Args: `goal`, `backend`, optional `model`, `role`, `dependencies`, `executionPolicy`, **`description`**, **`brief`** (partial `TaskBriefV1`), **`inputBindings`**, **`claimsGit`**, **`writePaths`/`readPaths`** |
+| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same rich args as `create_task`) |
 | `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents |
 | `start_task` | **Host / recovery only** | Not in coordinator MCP `allowedActions`; rejects draft |
-| `interrupt_task` | Coordinator | Interrupt an active direct child turn |
-| `cancel_task` | Coordinator | Request cancel of a direct child (host may cascade per policy); persists `sealedBy` |
+| `interrupt_task` | Coordinator | Interrupt an active direct child turn (`interrupt_child` cap) |
+| `cancel_task` | Coordinator | Cancel direct child + cascade unfinished descendants (`cancel_child` cap); `sealedBy.coordinator` |
+| `set_task_lifecycle` | Coordinator | **Parent-seal** a direct child's lifecycle (`succeeded`/`failed`/`cancelled`/`skipped`) when the child omitted disposition (`cancel_child` cap). See §5.3 |
 | `wait_for_tasks` | Coordinator | Stage the caller turn's explicit child wait set (`wakeOn` default: terminal + attention) |
 | `get_task_status` | Coordinator | Subtree summary: lifecycle, `releaseState`, **readiness**, attention, result.summary |
+| `get_host_context` | **Any task** | Read-only role-filtered host env / self / rules JSON (same builder as first-turn host block). **No `opId`**, no op ledger |
 | `complete_task` | Any task | Stage successful completion; **seal or propose** per outcome mode + role (§4.1.1) |
 | `fail_task` | Any task | Stage failure; seal or propose per mode + role |
 | `report_progress` | Any task | Update optional progress metadata |
@@ -816,6 +835,15 @@ tools.
 
 **Happy path (multi-node graph):** `create_task*` (draft) → `release_tasks` → `wait_for_tasks`.  
 Coordinator does **not** start CLI processes via `start_task`.
+
+**Capability grants:** root coordinators and coordinator-role children include
+`cancel_child` (+ `interrupt_child`) so `cancel_task` / `set_task_lifecycle` are
+listed. Store load backfills missing `cancel_child` on existing coordinators.
+Workers never receive graph mutators.
+
+**First-turn host context:** every task's **sequence-1** turn freezes a compiled
+prompt: `# Muster host context` (role-tiered) → brief → untrusted pins. Turn 2+
+does not re-prefix host; agents may call `get_host_context` to refresh.
 
 **Dataflow:** `inputBindings` + `TaskResultV1` (`summary` only v1); durable pin on turn before dispatch.  
 **Ordering** still uses `dependencies` separately.

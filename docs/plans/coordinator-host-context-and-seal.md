@@ -1,7 +1,7 @@
 # Plan: Host context + rich task fields → first-turn prompt + parent seal MCP + queue UX
 
 ## Status
-**APPROVED** — codex-plan-review 2026-07-14 (4 rounds; ISSUE-1…8 fixed). Ready to implement W0→W6.
+**IMPLEMENTED** — W0–W6 on `main` (2026-07-14). Plan-review APPROVED; each Wi codex-impl-reviewed.
 
 Depends on: Phase F orchestration (W1–W9) on `main` (`docs/plans/task-orchestration-auto-run.md`).
 
