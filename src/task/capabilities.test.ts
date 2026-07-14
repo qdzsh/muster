@@ -38,5 +38,15 @@ describe('capabilitiesFor', () => {
     expect(caps.has('upsert_presentation')).toBe(false);
     expect(caps.has('complete_task')).toBe(true);
     expect(caps.has('ask_user')).toBe(true);
+    expect(caps.has('get_host_context')).toBe(true);
+  });
+
+  it('grants get_host_context to coordinators and workers', () => {
+    expect(
+      capabilitiesFor({ role: 'coordinator', capabilities: [] }).has('get_host_context'),
+    ).toBe(true);
+    expect(capabilitiesFor({ role: 'worker', capabilities: [] }).has('get_host_context')).toBe(
+      true,
+    );
   });
 });

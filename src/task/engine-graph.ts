@@ -9,6 +9,11 @@ import { capabilitiesFor } from './capabilities';
 import type { ToolCommand } from './coordinator-tools';
 import { validateBindingsForRelease } from './dataflow';
 import {
+  buildHostContext,
+  minimalHostSnapshot,
+  type HostEnvironmentSnapshot,
+} from './host-context';
+import {
   bridgeTokenTtlMs,
   canCreateTurn,
   checkLimit,
@@ -145,6 +150,9 @@ export interface GraphEngineDeps {
   onRescanSchedulableTurns?: (affectedTaskIds?: readonly string[]) => void;
   /** W9: workspace trust predicate for create-and-run paths. */
   isWorkspaceTrusted?: () => boolean;
+  /** W3: sync host env cache for get_host_context (same as first-turn inject). */
+  getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
+  workspaceFolder?: string;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
   writeCancelRequest: (
@@ -270,7 +278,11 @@ export async function executeToolCommand(
     return { ok: false, error: `action not permitted: ${actionForCommand(command)}` };
   }
 
-  if (command.kind !== 'get_task_status' && command.kind !== 'report_progress') {
+  if (
+    command.kind !== 'get_task_status' &&
+    command.kind !== 'report_progress' &&
+    command.kind !== 'get_host_context'
+  ) {
     const existing = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
     if (existing) {
       if (existing.fingerprint !== fingerprint) {
@@ -864,6 +876,38 @@ export async function executeToolCommand(
         };
       }).filter((n): n is NonNullable<typeof n> => n !== undefined);
       return { ok: true, result: { root: targetId, tasks: nodes.slice(0, 32) } };
+    }
+
+    case 'get_host_context': {
+      // Read-only: no opId, no ledger. Same builder as first-turn host inject.
+      const file = deps.store.getFile();
+      const task = file.tasks[ctx.callerTaskId];
+      if (!task) return { ok: false, error: 'task not found' };
+      const trusted = deps.isWorkspaceTrusted?.() ?? true;
+      const cached = deps.getHostEnvironment?.();
+      const cwd =
+        (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
+        cached?.cwd ??
+        deps.workspaceFolder ??
+        process.cwd();
+      const snapshot: HostEnvironmentSnapshot = cached
+        ? { ...cached, cwd, trusted }
+        : minimalHostSnapshot(cwd, trusted);
+      const tools = [...capabilitiesFor(task)].sort();
+      const host = buildHostContext({
+        snapshot,
+        self: {
+          taskId: task.id,
+          role: task.role,
+          backend: task.backend,
+          ...(task.model !== undefined ? { model: task.model } : {}),
+          ...(task.parentId ? { parentTaskId: task.parentId } : {}),
+          ...(task.goal ? { goal: task.goal } : {}),
+        },
+        tools,
+        taskCwd: task.cwd,
+      });
+      return { ok: true, result: host };
     }
 
     case 'upsert_presentation':

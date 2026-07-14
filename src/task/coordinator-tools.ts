@@ -61,6 +61,7 @@ export type ToolCommand =
   | { kind: 'cancel_task'; opId: string; childId: string }
   | { kind: 'wait_for_tasks'; opId: string; taskIds: string[] }
   | { kind: 'get_task_status'; taskId?: string }
+  | { kind: 'get_host_context' }
   | { kind: 'complete_task'; opId: string; result: string }
   | { kind: 'fail_task'; opId: string; error: string }
   | { kind: 'report_progress'; opId: string; note: string }
@@ -100,6 +101,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'cancel_task',
     'wait_for_tasks',
     'get_task_status',
+    'get_host_context',
     'complete_task',
     'fail_task',
     'report_progress',
@@ -538,6 +540,14 @@ export function dispatch(
   if (tool === 'get_task_status') {
     const taskId = typeof args.taskId === 'string' ? args.taskId : undefined;
     return { ok: true, command: { kind: 'get_task_status', taskId } };
+  }
+
+  if (tool === 'get_host_context') {
+    // Read-only: no opId; empty args only.
+    if (Object.keys(args).length > 0) {
+      return { ok: false, toolError: 'get_host_context takes no arguments' };
+    }
+    return { ok: true, command: { kind: 'get_host_context' } };
   }
 
   return { ok: false, toolError: `unsupported tool: ${tool}` };

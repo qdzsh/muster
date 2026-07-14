@@ -651,6 +651,10 @@ export class TaskEngine {
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
       onRescanSchedulableTurns: (ids) => this.rescanSchedulableTurns(ids),
       isWorkspaceTrusted: () => this.isWorkspaceTrusted(),
+      getHostEnvironment: this.getHostEnvironment
+        ? () => this.getHostEnvironment!()
+        : undefined,
+      workspaceFolder: this.workspaceFolder,
       leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
       ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {

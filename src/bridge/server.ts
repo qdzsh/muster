@@ -39,6 +39,7 @@ const ALL_TOOLS: ToolAction[] = [
   'cancel_task',
   'wait_for_tasks',
   'get_task_status',
+  'get_host_context',
   'complete_task',
   'fail_task',
   'report_progress',
@@ -212,6 +213,11 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
+  get_host_context: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
   complete_task: {
     type: 'object',
     required: ['opId', 'result'],
@@ -309,7 +315,10 @@ function createMcpServer(
     return {
       tools: ALL_TOOLS.filter((name) => allowed.has(name)).map((name) => ({
         name,
-        description: `Muster coordinator tool: ${name}`,
+        description:
+          name === 'get_host_context'
+            ? 'Refresh trusted host env, self ids, and role rules (same data as first-turn host block).'
+            : `Muster coordinator tool: ${name}`,
         inputSchema: TOOL_INPUT_SCHEMAS[name],
       })),
     };

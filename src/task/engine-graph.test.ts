@@ -249,6 +249,118 @@ describe('engine graph orchestration', () => {
     expect(turns[0]?.trigger).toBe('engine');
   });
 
+  it('W3: get_host_context returns role-filtered JSON with zero op-ledger rows', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const hostSnap = {
+      cwd: '/ws',
+      trusted: true,
+      availableBackends: ['opencode'],
+      models: {
+        opencode: {
+          current: 'm1',
+          options: [{ value: 'm1', name: 'M1' }],
+        },
+      },
+    };
+    // Re-load engine with host cache for this test
+    const engineWithHost = TaskEngine.load({
+      store,
+      makeBackend: () => ({
+        name: 'grok',
+        capabilities: MCP_CAPS,
+        async *run() {
+          yield { type: 'sessionStarted', sessionId: 's' };
+          yield { type: 'turnCompleted' };
+        },
+      }),
+      askBridge: new AskBridge(),
+      credentialRegistry: credentials,
+      bridgePort: 19999,
+      getHostEnvironment: () => hostSnap,
+      isWorkspaceTrusted: () => true,
+    });
+    engineWithHost.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engineWithHost.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await new Promise((r) => setTimeout(r, 30));
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['get_host_context', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const opsBefore = Object.keys(store.getFile().operations ?? {}).length;
+    const result = await engineWithHost.handleToolCall(ctx, 'get_host_context', {
+      kind: 'get_host_context',
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const host = result.result as {
+      version: number;
+      self: { taskId: string; role: string };
+      availableBackends?: string[];
+      scope?: unknown;
+    };
+    expect(host.version).toBe(1);
+    expect(host.self.taskId).toBe('coord');
+    expect(host.self.role).toBe('coordinator');
+    expect(host.availableBackends).toEqual(['opencode']);
+    expect(host.scope).toBeUndefined();
+    const opsAfter = Object.keys(store.getFile().operations ?? {}).length;
+    expect(opsAfter).toBe(opsBefore);
+
+    // Second call still works, still no ledger growth
+    const again = await engineWithHost.handleToolCall(ctx, 'get_host_context', {
+      kind: 'get_host_context',
+    });
+    expect(again.ok).toBe(true);
+    expect(Object.keys(store.getFile().operations ?? {}).length).toBe(opsBefore);
+  });
+
+  it('W3: get_host_context for worker omits backends/models', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'worker-1',
+      goal: 'do work',
+      backend: 'grok',
+      role: 'worker',
+      capabilities: [],
+    });
+    const started = engine.startTask('worker-1');
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'worker-1',
+      callerTaskId: 'worker-1',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['get_host_context', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    // harness engine has no getHostEnvironment → minimal snapshot
+    const result = await engine.handleToolCall(ctx, 'get_host_context', {
+      kind: 'get_host_context',
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const host = result.result as {
+      availableBackends?: string[];
+      models?: unknown;
+      scope?: { singleTask: boolean };
+    };
+    expect(host.availableBackends).toBeUndefined();
+    expect(host.models).toBeUndefined();
+    expect(host.scope?.singleTask).toBe(true);
+  });
+
   it('W2: create_task with brief AC and paths persists on child', async () => {
     const { store, engine, credentials } = makeHarness();
     engine.createTask({

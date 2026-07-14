@@ -339,6 +339,20 @@ describe('coordinator-tools dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
   });
 
+  it('maps get_host_context with empty args and no opId', () => {
+    const result = dispatch('get_host_context', {}, ctx(['get_host_context']));
+    expect(result).toEqual({ ok: true, command: { kind: 'get_host_context' } });
+  });
+
+  it('rejects get_host_context with extra args', () => {
+    const result = dispatch(
+      'get_host_context',
+      { foo: 1 },
+      ctx(['get_host_context']),
+    );
+    expect(result.ok).toBe(false);
+  });
+
   it('maps rich fields on delegate_task', () => {
     const result = dispatch(
       'delegate_task',

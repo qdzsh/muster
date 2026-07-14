@@ -11,7 +11,12 @@ export type CoordinatorAction =
   | 'get_task_status'
   | 'upsert_presentation';
 
-export type AnyTaskAction = 'complete_task' | 'fail_task' | 'report_progress' | 'ask_user';
+export type AnyTaskAction =
+  | 'complete_task'
+  | 'fail_task'
+  | 'report_progress'
+  | 'ask_user'
+  | 'get_host_context';
 
 export type ToolAction = CoordinatorAction | AnyTaskAction;
 
@@ -31,6 +36,7 @@ const ANY_TASK_ACTIONS: AnyTaskAction[] = [
   'fail_task',
   'report_progress',
   'ask_user',
+  'get_host_context',
 ];
 
 export function capabilitiesFor(
