@@ -469,6 +469,8 @@ export interface CancelRequest {
   at: string;
   /** Optional durable sealer for remote cancel settlement (W4). */
   sealedBy?: TaskSealedBy;
+  /** Optional reason for parent-seal cancel (W4 set_task_lifecycle). */
+  reason?: string;
 }
 
 export interface OperationLedgerEntry {

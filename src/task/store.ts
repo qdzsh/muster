@@ -398,6 +398,28 @@ export function sanitizeTaskHandoffs(file: TaskStoreFile): TaskStoreFile {
   return file;
 }
 
+/**
+ * W4: backfill cancel_child (+ interrupt_child) on coordinator tasks missing it.
+ * Schema-compatible; no version bump.
+ */
+export function ensureCoordinatorCancelChild(file: TaskStoreFile): TaskStoreFile {
+  for (const task of Object.values(file.tasks)) {
+    if (task.role !== 'coordinator') continue;
+    const caps = task.capabilities ?? [];
+    let next = caps;
+    if (!caps.includes('cancel_child')) {
+      next = [...next, 'cancel_child'];
+    }
+    if (!caps.includes('interrupt_child')) {
+      next = [...next, 'interrupt_child'];
+    }
+    if (next !== caps) {
+      task.capabilities = next;
+    }
+  }
+  return file;
+}
+
 export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFile {
   if (file.schemaVersion > targetVersion) {
     throw new Error(
@@ -445,8 +467,8 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);
   }
-  // Schema-compatible optional field: sanitize handoff without a schema bump.
-  return sanitizeTaskHandoffs(current);
+  // Schema-compatible optional fields: sanitize handoff + coordinator cancel caps.
+  return ensureCoordinatorCancelChild(sanitizeTaskHandoffs(current));
 }
 
 function parseStoreFile(raw: string, targetVersion: number): TaskStoreFile {

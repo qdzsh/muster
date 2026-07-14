@@ -59,6 +59,15 @@ export type ToolCommand =
   | { kind: 'start_task'; opId: string; childId: string }
   | { kind: 'interrupt_task'; opId: string; childId: string }
   | { kind: 'cancel_task'; opId: string; childId: string }
+  | {
+      kind: 'set_task_lifecycle';
+      opId: string;
+      taskId: string;
+      lifecycle: 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+      result?: string;
+      error?: string;
+      reason?: string;
+    }
   | { kind: 'wait_for_tasks'; opId: string; taskIds: string[] }
   | { kind: 'get_task_status'; taskId?: string }
   | { kind: 'get_host_context' }
@@ -83,6 +92,7 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'start_task',
   'interrupt_task',
   'cancel_task',
+  'set_task_lifecycle',
   'wait_for_tasks',
   'complete_task',
   'fail_task',
@@ -99,6 +109,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'start_task',
     'interrupt_task',
     'cancel_task',
+    'set_task_lifecycle',
     'wait_for_tasks',
     'get_task_status',
     'get_host_context',
@@ -458,6 +469,52 @@ export function dispatch(
           return { ok: false, toolError: 'childId is required' };
         }
         return { ok: true, command: { kind: 'cancel_task', opId, childId } };
+      }
+      case 'set_task_lifecycle': {
+        const taskId = requireString(args, 'taskId') ?? requireString(args, 'childId');
+        if (!taskId) {
+          return { ok: false, toolError: 'taskId is required' };
+        }
+        const lifecycle = args.lifecycle;
+        if (
+          lifecycle !== 'succeeded' &&
+          lifecycle !== 'failed' &&
+          lifecycle !== 'cancelled' &&
+          lifecycle !== 'skipped'
+        ) {
+          return { ok: false, toolError: 'lifecycle must be succeeded|failed|cancelled|skipped' };
+        }
+        if (lifecycle === 'succeeded') {
+          const result = requireString(args, 'result');
+          if (!result) {
+            return { ok: false, toolError: 'result is required for succeeded' };
+          }
+          return {
+            ok: true,
+            command: { kind: 'set_task_lifecycle', opId, taskId, lifecycle, result },
+          };
+        }
+        if (lifecycle === 'failed') {
+          const error = requireString(args, 'error');
+          if (!error) {
+            return { ok: false, toolError: 'error is required for failed' };
+          }
+          return {
+            ok: true,
+            command: { kind: 'set_task_lifecycle', opId, taskId, lifecycle, error },
+          };
+        }
+        const reason = typeof args.reason === 'string' ? args.reason : undefined;
+        return {
+          ok: true,
+          command: {
+            kind: 'set_task_lifecycle',
+            opId,
+            taskId,
+            lifecycle,
+            ...(reason !== undefined ? { reason } : {}),
+          },
+        };
       }
       case 'wait_for_tasks': {
         const raw = args.taskIds;

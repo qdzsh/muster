@@ -49,4 +49,13 @@ describe('capabilitiesFor', () => {
       true,
     );
   });
+
+  it('maps cancel_child to cancel_task and set_task_lifecycle', () => {
+    const caps = capabilitiesFor({
+      role: 'coordinator',
+      capabilities: ['cancel_child'],
+    });
+    expect(caps.has('cancel_task')).toBe(true);
+    expect(caps.has('set_task_lifecycle')).toBe(true);
+  });
 });

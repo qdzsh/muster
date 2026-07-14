@@ -37,6 +37,7 @@ const ALL_TOOLS: ToolAction[] = [
   'start_task',
   'interrupt_task',
   'cancel_task',
+  'set_task_lifecycle',
   'wait_for_tasks',
   'get_task_status',
   'get_host_context',
@@ -197,6 +198,19 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
+  set_task_lifecycle: {
+    type: 'object',
+    required: ['opId', 'taskId', 'lifecycle'],
+    properties: {
+      opId: OP_ID,
+      taskId: OP_ID,
+      lifecycle: { enum: ['succeeded', 'failed', 'cancelled', 'skipped'] },
+      result: { type: 'string', minLength: 1 },
+      error: { type: 'string', minLength: 1 },
+      reason: { type: 'string' },
+    },
+    additionalProperties: false,
+  },
   wait_for_tasks: {
     type: 'object',
     required: ['opId', 'taskIds'],
@@ -318,7 +332,9 @@ function createMcpServer(
         description:
           name === 'get_host_context'
             ? 'Refresh trusted host env, self ids, and role rules (same data as first-turn host block).'
-            : `Muster coordinator tool: ${name}`,
+            : name === 'set_task_lifecycle'
+              ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
+              : `Muster coordinator tool: ${name}`,
         inputSchema: TOOL_INPUT_SCHEMAS[name],
       })),
     };

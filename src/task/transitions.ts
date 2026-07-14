@@ -582,9 +582,29 @@ export function applyFailedTurn(
   };
 }
 
+function terminalPayloadMatches(
+  task: MusterTask,
+  lifecycle: TaskLifecycleState,
+  options: { result?: string; error?: string; reason?: string },
+): boolean {
+  if (lifecycle === 'succeeded') {
+    const existing = task.taskResult?.summary ?? task.result ?? '';
+    const next = options.result ?? '';
+    return existing === next;
+  }
+  if (lifecycle === 'failed') {
+    return (task.error ?? '') === (options.error ?? '');
+  }
+  if (lifecycle === 'cancelled' || lifecycle === 'skipped') {
+    return task.reason === options.reason;
+  }
+  return true;
+}
+
 /**
  * User (or authorized coordinator host path) sets task lifecycle explicitly.
  * Not driven by CLI process status.
+ * Compatible terminal replay = exact payload equality → identity no-op (no sealedBy mutate).
  */
 export function setTaskLifecycle(
   task: MusterTask,
@@ -593,6 +613,7 @@ export function setTaskLifecycle(
     now: string;
     result?: string;
     error?: string;
+    reason?: string;
     /** Required on every terminal seal (W4). */
     sealedBy?: TaskSealedBy;
   },
@@ -600,23 +621,22 @@ export function setTaskLifecycle(
   const sealedBy = options.sealedBy ?? { kind: 'user' as const };
 
   if (task.lifecycle === lifecycle) {
-    const sameSucceededPatch: Partial<MusterTask> = { outcomeProposal: undefined };
-    if (lifecycle === 'succeeded' && options.result !== undefined) {
-      const taskResult = buildTaskResultFromSummary(options.result, task.taskResult);
-      sameSucceededPatch.taskResult = taskResult;
-      sameSucceededPatch.result = taskResult.summary;
-    }
-    if (lifecycle === 'failed' && options.error !== undefined) {
-      sameSucceededPatch.error = options.error;
-    }
     if (isTerminalLifecycle(lifecycle)) {
-      sameSucceededPatch.sealedBy = sealedBy;
+      if (terminalPayloadMatches(task, lifecycle, options)) {
+        // Compatible replay: preserve sealedBy, revision, timestamps.
+        return { ok: true, next: task, effects: [] };
+      }
+      return { ok: false, reason: 'already_terminal' };
     }
     return {
       ok: true,
-      next: bumpTask(task, options.now, sameSucceededPatch),
+      next: bumpTask(task, options.now, { outcomeProposal: undefined }),
       effects: [{ kind: 'emitUpdate' }],
     };
+  }
+
+  if (isTerminalLifecycle(task.lifecycle) && isTerminalLifecycle(lifecycle)) {
+    return { ok: false, reason: 'already_terminal' };
   }
 
   if (lifecycle === 'open') {
@@ -675,6 +695,8 @@ export function setTaskLifecycle(
         finishedAt: options.now,
         outcomeProposal: undefined,
         sealedBy,
+        // Always set reason (including undefined) so reopened tasks don't keep stale reasons.
+        reason: options.reason,
       }),
       effects: [{ kind: 'emitUpdate' }],
     };

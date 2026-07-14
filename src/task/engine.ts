@@ -985,7 +985,13 @@ export class TaskEngine {
       backend: params.backend,
       model: params.model,
       cwd: params.cwd,
-      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+      capabilities: [
+        'create_child',
+        'wait_child',
+        'read_subtree',
+        'cancel_child',
+        'interrupt_child',
+      ],
       executionPolicy: DEFAULT_POLICY,
       // Host composer create-and-run: atomic released (plan W3 matrix).
       releaseState: 'released',
@@ -1279,7 +1285,13 @@ export class TaskEngine {
       backend: params.backend,
       cwd: params.cwd,
       capabilities:
-        params.capabilities ?? ['create_child', 'wait_child', 'read_subtree'],
+        params.capabilities ?? [
+          'create_child',
+          'wait_child',
+          'read_subtree',
+          'cancel_child',
+          'interrupt_child',
+        ],
       executionPolicy: params.executionPolicy ?? DEFAULT_POLICY,
     };
 

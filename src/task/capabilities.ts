@@ -7,6 +7,7 @@ export type CoordinatorAction =
   | 'start_task'
   | 'interrupt_task'
   | 'cancel_task'
+  | 'set_task_lifecycle'
   | 'wait_for_tasks'
   | 'get_task_status'
   | 'upsert_presentation';
@@ -27,7 +28,7 @@ const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
   start_child: [],
   wait_child: ['wait_for_tasks'],
   interrupt_child: ['interrupt_task'],
-  cancel_child: ['cancel_task'],
+  cancel_child: ['cancel_task', 'set_task_lifecycle'],
   read_subtree: ['get_task_status'],
 };
 

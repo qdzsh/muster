@@ -39,6 +39,8 @@ import {
   submitAnswer,
   cancelTask as transitionCancelTask,
   isTerminalLifecycle,
+  mayParentSealDirect,
+  setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
 } from './transitions';
 import type { DepGraph } from './deps';
@@ -122,7 +124,15 @@ function descendantIds(file: TaskStoreFile, rootId: string): string[] {
 }
 
 // start_child intentionally omitted — start_task is host/recovery only (W3).
-const DEFAULT_CHILD_CAPS: TaskCapability[] = ['create_child', 'wait_child', 'read_subtree'];
+const DEFAULT_WORKER_CAPS: TaskCapability[] = ['create_child', 'wait_child', 'read_subtree'];
+/** Coordinator children get parent-seal reachability (cancel_child + interrupt). */
+const DEFAULT_COORDINATOR_CHILD_CAPS: TaskCapability[] = [
+  'create_child',
+  'wait_child',
+  'read_subtree',
+  'cancel_child',
+  'interrupt_child',
+];
 const DEFAULT_POLICY: TaskExecutionPolicy = {
   maxTurns: 50,
   maxAutomaticRetries: 2,
@@ -374,7 +384,10 @@ export async function executeToolCommand(
           // Children inherit the parent's workspace directory so delegated
           // sub-tasks run in the same place and never fall back to process.cwd().
           cwd: caller.cwd,
-          capabilities: DEFAULT_CHILD_CAPS,
+          capabilities:
+            (command.spec.role ?? 'worker') === 'coordinator'
+              ? DEFAULT_COORDINATOR_CHILD_CAPS
+              : DEFAULT_WORKER_CAPS,
           // Never trust the raw agent-supplied policy: clamp every field to bounds.
           executionPolicy: clampExecutionPolicy(
             DEFAULT_POLICY,
@@ -786,6 +799,236 @@ export async function executeToolCommand(
       return { ok: true, result: { cancelled: command.childId } };
     }
 
+    case 'set_task_lifecycle': {
+      const file = deps.store.getFile();
+      const target = file.tasks[command.taskId];
+      if (!target || target.parentId !== ctx.callerTaskId) {
+        return { ok: false, error: 'not an owned direct child' };
+      }
+      if (command.taskId === ctx.callerTaskId) {
+        return { ok: false, error: 'cannot seal self' };
+      }
+      const rootId = findRootId(file, ctx.callerTaskId);
+      const rootPolicy = file.tasks[rootId]?.childOrchestrationSeal;
+      if (!mayParentSealDirect(target, rootPolicy)) {
+        return {
+          ok: false,
+          error: 'parent seal rejected: root childOrchestrationSeal is propose_only',
+        };
+      }
+
+      const coordinatorSeal = {
+        kind: 'coordinator' as const,
+        taskId: ctx.callerTaskId,
+        turnId: ctx.turnId,
+        mode: 'parent_seal',
+      };
+
+      if (command.lifecycle === 'cancelled' || command.lifecycle === 'skipped') {
+        // Match cancel_task: remote-owned live → cancel request only (defer seal).
+        // Compatibility re-checked inside commit on the direct target.
+        const ids = [command.taskId, ...descendantIds(file, command.taskId)].reverse();
+        const liveToCleanup: string[] = [];
+        let noop = false;
+        const cascade = deps.store.commit((draft) => {
+          const direct = draft.tasks[command.taskId];
+          if (!direct) return { ok: false, reason: 'task not found' };
+          const probe = transitionSetTaskLifecycle(direct, command.lifecycle, {
+            now,
+            reason: command.reason,
+            sealedBy: coordinatorSeal,
+          });
+          if (!probe.ok) return probe;
+          if (probe.next === direct) {
+            noop = true;
+            writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+              ok: true,
+              data: { lifecycle: command.lifecycle, taskId: command.taskId, noop: true },
+            });
+            return { ok: true };
+          }
+
+          for (const taskId of ids) {
+            const task = draft.tasks[taskId];
+            if (!task || isTerminalLifecycle(task.lifecycle)) continue;
+            const currentPending = turnsForTask(draft, taskId).filter(
+              (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+            );
+            const currentLive = currentPending.find(
+              (t) => t.status === 'running' || t.status === 'waiting_user',
+            );
+            const remoteOwned =
+              !!currentLive &&
+              deps.leaseOwnerAlive(currentLive.id) &&
+              !deps.ownsLease(currentLive.id);
+            if (command.lifecycle === 'cancelled' && currentLive && remoteOwned) {
+              // Defer seal to processCancelRequests (cancel_task pattern).
+              // Always include reason (may be undefined) so parent_seal clears stale reasons.
+              draft.cancelRequests = draft.cancelRequests ?? {};
+              draft.cancelRequests[currentLive.id] = {
+                kind: 'cancel',
+                by: ctx.callerTaskId,
+                opId: command.opId,
+                at: now,
+                sealedBy: coordinatorSeal,
+                reason: command.reason,
+              };
+              continue;
+            }
+            if (command.lifecycle === 'cancelled') {
+              const cancelled = transitionCancelTask(task, {
+                liveTurn: currentLive,
+                now,
+                sealedBy: coordinatorSeal,
+              });
+              if (!cancelled.ok) return cancelled;
+              draft.tasks[taskId] = {
+                ...cancelled.next.task,
+                reason: command.reason,
+              };
+              if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
+              for (const pending of currentPending) {
+                if (pending.id === currentLive?.id) continue;
+                const settled = cancelPendingTurn(pending, { now });
+                if (!settled.ok) return settled;
+                draft.turns[pending.id] = settled.next;
+              }
+              if (currentLive) liveToCleanup.push(currentLive.id);
+            } else {
+              // skipped: always seal task locally (host skip pattern); remote live only interrupted.
+              const sealed = transitionSetTaskLifecycle(task, 'skipped', {
+                now,
+                reason: command.reason,
+                sealedBy: coordinatorSeal,
+              });
+              if (!sealed.ok) return sealed;
+              draft.tasks[taskId] = sealed.next;
+              if (currentLive && remoteOwned) {
+                draft.cancelRequests = draft.cancelRequests ?? {};
+                draft.cancelRequests[currentLive.id] = {
+                  kind: 'interrupt',
+                  by: ctx.callerTaskId,
+                  opId: command.opId,
+                  at: now,
+                  sealedBy: coordinatorSeal,
+                };
+              }
+              for (const pending of currentPending) {
+                if (currentLive && remoteOwned && pending.id === currentLive.id) continue;
+                if (pending.status === 'queued') {
+                  const settled = cancelPendingTurn(pending, { now });
+                  if (!settled.ok) return settled;
+                  draft.turns[pending.id] = settled.next;
+                } else {
+                  const interrupted = interruptTurn(pending, { now });
+                  if (!interrupted.ok) return interrupted;
+                  draft.turns[pending.id] = interrupted.next;
+                }
+              }
+              if (currentLive && !remoteOwned) liveToCleanup.push(currentLive.id);
+            }
+          }
+          writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+            ok: true,
+            data: { lifecycle: command.lifecycle, taskId: command.taskId },
+          });
+          return { ok: true };
+        });
+        if (!cascade.ok) {
+          return { ok: false, error: cascade.detail ?? cascade.reason };
+        }
+        if (!noop) {
+          for (const turnId of liveToCleanup) {
+            deps.liveRuns.get(turnId)?.controller.abort();
+            cleanupTurnResources(deps, turnId);
+          }
+          deps.onRescanSchedulableTurns?.();
+        }
+        return {
+          ok: true,
+          result: {
+            lifecycle: command.lifecycle,
+            taskId: command.taskId,
+            ...(noop ? { noop: true } : {}),
+          },
+        };
+      }
+
+      // succeeded | failed — seal target only (no grandchild cascade)
+      let sealChanged = false;
+      let liveIdToCleanup: string | undefined;
+      const commit = deps.store.commit((draft) => {
+        const task = draft.tasks[command.taskId];
+        if (!task) return { ok: false, reason: 'task not found' };
+        const sealed = transitionSetTaskLifecycle(task, command.lifecycle, {
+          now,
+          result: command.result,
+          error: command.error,
+          sealedBy: coordinatorSeal,
+        });
+        if (!sealed.ok) return sealed;
+        sealChanged = sealed.next !== task;
+        draft.tasks[command.taskId] = sealed.next;
+        if (sealChanged) {
+          const currentPending = turnsForTask(draft, command.taskId).filter(
+            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+          );
+          const live = currentPending.find(
+            (t) => t.status === 'running' || t.status === 'waiting_user',
+          );
+          const remoteOwned =
+            !!live && deps.leaseOwnerAlive(live.id) && !deps.ownsLease(live.id);
+          if (live && remoteOwned) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[live.id] = {
+              kind: 'interrupt',
+              by: ctx.callerTaskId,
+              opId: command.opId,
+              at: now,
+              sealedBy: coordinatorSeal,
+            };
+          } else if (live) {
+            liveIdToCleanup = live.id;
+          }
+          for (const p of currentPending) {
+            if (live && remoteOwned && p.id === live.id) continue;
+            if (p.status === 'queued') {
+              const cancelled = cancelPendingTurn(p, { now });
+              if (cancelled.ok) draft.turns[p.id] = cancelled.next;
+            } else {
+              const interrupted = interruptTurn(p, { now });
+              if (interrupted.ok) draft.turns[p.id] = interrupted.next;
+            }
+          }
+        }
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: {
+            lifecycle: command.lifecycle,
+            taskId: command.taskId,
+            ...(sealChanged ? {} : { noop: true }),
+          },
+        });
+        return { ok: true };
+      });
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      if (sealChanged && liveIdToCleanup) {
+        deps.liveRuns.get(liveIdToCleanup)?.controller.abort();
+        cleanupTurnResources(deps, liveIdToCleanup);
+      }
+      if (sealChanged) deps.onRescanSchedulableTurns?.();
+      return {
+        ok: true,
+        result: {
+          lifecycle: command.lifecycle,
+          taskId: command.taskId,
+          ...(sealChanged ? {} : { noop: true }),
+        },
+      };
+    }
+
     case 'wait_for_tasks': {
       const owned = command.taskIds.every((id) => draftChildOwned(deps.store.getFile(), ctx.callerTaskId, id));
       if (!owned) return { ok: false, error: 'taskIds must be owned direct children' };
@@ -988,7 +1231,13 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
                   }),
           });
           if (cancelled.ok) {
-            draft.tasks[task.id] = cancelled.next.task;
+            // parent_seal always applies reason (including undefined to clear stale).
+            const isParentSeal =
+              request.sealedBy?.kind === 'coordinator' &&
+              request.sealedBy.mode === 'parent_seal';
+            draft.tasks[task.id] = isParentSeal
+              ? { ...cancelled.next.task, reason: request.reason }
+              : cancelled.next.task;
             if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
             for (const pending of pendingTurns) {
               if (pending.id === turn.id) continue;

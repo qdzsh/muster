@@ -249,6 +249,121 @@ describe('engine graph orchestration', () => {
     expect(turns[0]?.trigger).toBe('engine');
   });
 
+  it('W4: set_task_lifecycle succeeded seals direct child with coordinator seal', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree', 'cancel_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    await new Promise((r) => setTimeout(r, 30));
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task', 'set_task_lifecycle', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-c',
+      spec: { goal: 'child work', backend: 'grok', role: 'worker' },
+    });
+    const childId = deriveEntityId(started.value.turnId, 'op-c', 'task');
+    // release via host startTask after marking released
+    store.commit((draft) => {
+      draft.tasks[childId] = {
+        ...draft.tasks[childId]!,
+        releaseState: 'released',
+        revision: draft.tasks[childId]!.revision + 1,
+      };
+      return { ok: true };
+    });
+
+    const sealed = await engine.handleToolCall(ctx, 'set_task_lifecycle', {
+      kind: 'set_task_lifecycle',
+      opId: 'op-seal',
+      taskId: childId,
+      lifecycle: 'succeeded',
+      result: 'done by parent',
+    });
+    expect(sealed.ok).toBe(true);
+    const child = store.getTask(childId);
+    expect(child?.lifecycle).toBe('succeeded');
+    expect(child?.taskResult?.summary).toBe('done by parent');
+    expect(child?.sealedBy).toEqual({
+      kind: 'coordinator',
+      taskId: 'coord',
+      turnId: started.value.turnId,
+      mode: 'parent_seal',
+    });
+
+    // compatible replay: no mutation
+    const rev = child!.revision;
+    const again = await engine.handleToolCall(ctx, 'set_task_lifecycle', {
+      kind: 'set_task_lifecycle',
+      opId: 'op-seal-2',
+      taskId: childId,
+      lifecycle: 'succeeded',
+      result: 'done by parent',
+    });
+    expect(again.ok).toBe(true);
+    expect(store.getTask(childId)?.revision).toBe(rev);
+    expect(store.getTask(childId)?.sealedBy?.kind).toBe('coordinator');
+
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('W4: set_task_lifecycle propose_only rejects parent seal', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'cancel_child'],
+    });
+    store.commit((draft) => {
+      draft.tasks.coord = {
+        ...draft.tasks.coord!,
+        childOrchestrationSeal: 'propose_only',
+      };
+      return { ok: true };
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task', 'set_task_lifecycle']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-c',
+      spec: { goal: 'c', backend: 'grok' },
+    });
+    const childId = deriveEntityId(started.value.turnId, 'op-c', 'task');
+    const result = await engine.handleToolCall(ctx, 'set_task_lifecycle', {
+      kind: 'set_task_lifecycle',
+      opId: 'op-seal',
+      taskId: childId,
+      lifecycle: 'succeeded',
+      result: 'x',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/propose_only/);
+  });
+
   it('W3: get_host_context returns role-filtered JSON with zero op-ledger rows', async () => {
     const { store, engine, credentials } = makeHarness();
     const hostSnap = {
