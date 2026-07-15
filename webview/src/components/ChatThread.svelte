@@ -43,7 +43,11 @@
   }
 
   function onScroll() {
-    if (!scrollEl || scrollLocked) return;
+    if (!scrollEl) return;
+    if (scrollLocked) {
+      if (frozenScrollTop !== null) scrollEl.scrollTop = frozenScrollTop;
+      return;
+    }
     pinned = isNearBottom(scrollEl);
   }
 

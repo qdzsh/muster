@@ -4861,6 +4861,119 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
   });
 });
 
+test.describe('Owning-root task tree navigation', () => {
+  test('opens tree panel, freezes scroll, preserves draft, and selects child', async ({ page }) => {
+    await openWebview(page);
+
+    const root = task({
+      id: 'coord-root',
+      role: 'coordinator',
+      goal: 'Coordinate multi-child work',
+      viewStatus: 'running',
+      runtimeActivity: 'running',
+    });
+    const childA = task({
+      id: 'worker-a',
+      parentId: 'coord-root',
+      role: 'worker',
+      goal: 'Auth worker',
+      viewStatus: 'idle',
+      runtimeActivity: 'idle',
+    });
+    const childB = task({
+      id: 'worker-b',
+      parentId: 'coord-root',
+      role: 'worker',
+      goal: 'Docs worker',
+      viewStatus: 'waiting_user',
+      runtimeActivity: 'waiting_user',
+    });
+
+    const longAssistant = Array.from({ length: 40 }, (_, i) => `Line ${i + 1} of transcript body.`).join(
+      '\n',
+    );
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'coord-root',
+      subtree: [root, childA, childB],
+      transcript: [
+        { id: 'msg-u', kind: 'user', content: 'Kick off children' },
+        { id: 'msg-a', kind: 'assistant', content: longAssistant },
+      ],
+      storeRevision: 900,
+    });
+
+    await expect(page.getByTestId('task-tree-nav')).toBeVisible();
+    await expect(page.getByTestId('task-tree-summary')).toContainText('Tasks 3');
+
+    const scrollRegion = page.locator('.task-workspace-main .overflow-y-auto').first();
+    await scrollRegion.evaluate((el) => {
+      el.scrollTop = 80;
+    });
+    const scrollBefore = await scrollRegion.evaluate((el) => el.scrollTop);
+    expect(scrollBefore).toBeGreaterThan(0);
+
+    const composer = page.getByPlaceholder(/Message coord-root|Message|Continue|Ask/i).first();
+    // Prefer task composer placeholder when available.
+    const taskComposer = page.locator('textarea.composer-input__textarea, textarea').last();
+    await taskComposer.fill('draft stays while tree open');
+
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-panel')).toBeVisible();
+
+    await scrollRegion.evaluate((el) => {
+      el.scrollTop = 400;
+    });
+    await expect
+      .poll(async () => scrollRegion.evaluate((el) => el.scrollTop))
+      .toBe(scrollBefore);
+
+    await expect(taskComposer).toHaveValue('draft stays while tree open');
+
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('task-tree-panel')).toHaveCount(0);
+    await expect(taskComposer).toHaveValue('draft stays while tree open');
+    await expect
+      .poll(async () => scrollRegion.evaluate((el) => el.scrollTop))
+      .toBe(scrollBefore);
+
+    await page.getByTestId('task-tree-summary').click();
+    await page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' }).click();
+
+    await expect
+      .poll(async () => {
+        const messages = await postedMessages(page);
+        return messages.some(
+          (m) =>
+            typeof m === 'object' &&
+            m !== null &&
+            (m as { type?: string }).type === 'focusTask' &&
+            (m as { taskId?: string }).taskId === 'worker-a',
+        );
+      })
+      .toBe(true);
+
+    // Host would normally reply with child snapshot; simulate isolation.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'worker-a',
+      subtree: [root, childA, childB],
+      transcript: [{ id: 'msg-child', kind: 'user', content: 'only child transcript' }],
+      storeRevision: 901,
+    });
+
+    await expect(page.getByText('only child transcript')).toBeVisible();
+    await expect(page.getByText('Kick off children')).toHaveCount(0);
+    // Child focus shows breadcrumb (I3) and/or parent control (I1).
+    await expect(
+      page.getByTestId('task-tree-breadcrumb').or(page.getByTestId('task-tree-parent')),
+    ).toBeVisible();
+  });
+});
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {
