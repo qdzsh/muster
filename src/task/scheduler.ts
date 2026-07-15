@@ -133,11 +133,27 @@ export function canPromoteTurn(
     return { ok: false, reason: 'earlier queued turn must run first' };
   }
 
+  // Parent-question / attention wakes may run while the parent is waiting on children.
+  const isOrchestrationWake =
+    turn.trigger === 'engine' &&
+    (turn.id.includes('parent-q-') || turn.id.endsWith('-attention'));
+
   // W5: same readiness evaluator as get_task_status / UI (draft, deps, inputs, wait, handoff, holds).
   const readiness = evaluateTaskReadiness(file, turn.taskId);
   if (!readiness.schedulable) {
-    const reason = readinessToPromoteReason(readiness);
-    if (reason) return { ok: false, reason };
+    const onlyWaitingChildren =
+      readiness.reasons.some((r) => r.code === 'waiting_children') &&
+      readiness.reasons.every(
+        (r) =>
+          r.code === 'waiting_children' ||
+          r.code === 'queued' ||
+          r.code === 'ready' ||
+          r.code === 'needs_attention',
+      );
+    if (!(isOrchestrationWake && onlyWaitingChildren)) {
+      const reason = readinessToPromoteReason(readiness);
+      if (reason) return { ok: false, reason };
+    }
   }
   // Turn-specific holds still apply when readiness is otherwise clear.
   if (turn.holdAutoPromote) {
@@ -147,7 +163,7 @@ export function canPromoteTurn(
   if (dependenciesBlockTask(file, turn.taskId)) {
     return { ok: false, reason: 'dependencies not satisfied' };
   }
-  if (task.wait?.kind === 'children') {
+  if (task.wait?.kind === 'children' && !isOrchestrationWake) {
     return { ok: false, reason: 'waiting on child tasks' };
   }
   if (task.wait?.kind === 'external') {

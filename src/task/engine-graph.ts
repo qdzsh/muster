@@ -2170,8 +2170,25 @@ export async function executeToolCommand(
           return { ok: false, reason: 'unknown questionId' };
         }
         const child = draft.tasks[inbound.fromChildId];
-        if (!child || child.parentId !== ctx.callerTaskId) {
-          return { ok: false, reason: 'child not owned' };
+        // Direct child OR ancestor answering a routed grandchild question.
+        if (!child) {
+          return { ok: false, reason: 'child not found' };
+        }
+        let owned = child.parentId === ctx.callerTaskId;
+        if (!owned) {
+          let walk = child.parentId;
+          const seen = new Set<string>();
+          while (walk && !seen.has(walk)) {
+            seen.add(walk);
+            if (walk === ctx.callerTaskId) {
+              owned = true;
+              break;
+            }
+            walk = draft.tasks[walk]?.parentId ?? null;
+          }
+        }
+        if (!owned) {
+          return { ok: false, reason: 'child not in caller subtree' };
         }
         const pending = child.pendingParentQuestion;
         if (!pending || pending.questionId !== command.questionId) {
