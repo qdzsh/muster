@@ -2450,6 +2450,13 @@ export async function activate(context: vscode.ExtensionContext) {
       clientKey: 'muster-acp',
       promptForm: async (form, clientKey) => {
         const key = clientKey || 'muster-acp';
+        // Gate before UI register so non-root workers never surface to the user.
+        if (form.sessionId && taskEngine && !taskEngine.mayDirectAskUser(form.sessionId)) {
+          debugElicitation('host.elicitation_denied_non_root', {
+            sessionId: form.sessionId,
+          });
+          return { action: 'cancel' as const };
+        }
         const askLike = isAskLikeForm(form);
         const { promptId, promise } = eBridge.registerForm(key, form, askLike, 120_000);
         debugElicitation('host.elicitation_waiting', {
@@ -2483,6 +2490,9 @@ export async function activate(context: vscode.ExtensionContext) {
       },
       promptUrl: async (urlReq, clientKey) => {
         const key = clientKey || 'muster-acp';
+        if (urlReq.sessionId && taskEngine && !taskEngine.mayDirectAskUser(urlReq.sessionId)) {
+          return { action: 'cancel' as const };
+        }
         const { promise } = eBridge.registerUrl(key, urlReq, 120_000);
         try {
           return await promise;

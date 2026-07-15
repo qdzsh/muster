@@ -403,8 +403,9 @@ function projectChildOrchestration(
     }
     if (child.attention?.code === 'disposition_repair_pending') repairPending += 1;
     if (
-      child.attention?.code === 'awaiting_parent_answer' ||
-      child.pendingParentQuestion
+      child.pendingParentQuestion &&
+      child.pendingParentQuestion.answers === undefined &&
+      !child.pendingParentQuestion.continuationTurnId
     ) {
       needsParentInput += 1;
     }

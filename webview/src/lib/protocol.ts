@@ -133,6 +133,16 @@ export interface TaskSummary {
    * or summary/bootstrap bodies — those stay off TaskSummary and chat.
    */
   handoffProgress?: HandoffProgress;
+  /** Aggregate direct-child orchestration chrome for coordinators. */
+  childOrchestration?: {
+    total: number;
+    running: number;
+    open: number;
+    terminal: number;
+    repairPending: number;
+    needsParentInput: number;
+    label: string;
+  };
 }
 
 export interface TranscriptItem {
@@ -776,7 +786,16 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     (v.runtimeActivity === undefined ||
       v.runtimeActivity === null ||
       isString(v.runtimeActivity)) &&
-    (v.handoffProgress === undefined || isHandoffProgress(v.handoffProgress))
+    (v.handoffProgress === undefined || isHandoffProgress(v.handoffProgress)) &&
+    (v.childOrchestration === undefined ||
+      (isRecord(v.childOrchestration) &&
+        typeof v.childOrchestration.total === 'number' &&
+        typeof v.childOrchestration.running === 'number' &&
+        typeof v.childOrchestration.open === 'number' &&
+        typeof v.childOrchestration.terminal === 'number' &&
+        typeof v.childOrchestration.repairPending === 'number' &&
+        typeof v.childOrchestration.needsParentInput === 'number' &&
+        isString(v.childOrchestration.label)))
   );
 }
 

@@ -57,6 +57,7 @@
     if (activity === 'executing') flags.push('Turn working');
     if (activity === 'waiting_you') flags.push('Waiting for you');
     if (isSoftTerminal(task.lifecycle)) flags.push('Soft failed — send to reopen');
+    if (task.childOrchestration?.label) flags.push(task.childOrchestration.label);
     if (task.backend) flags.push(`Backend ${task.backend}`);
     if (task.continuationOf) flags.push('Continuation');
     return flags;

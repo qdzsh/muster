@@ -386,7 +386,8 @@ export async function executeToolCommand(
       command.waitForLocalIds.length > 0) ||
     (command.kind === 'release_tasks' &&
       command.waitForTaskIds !== undefined &&
-      command.waitForTaskIds.length > 0);
+      command.waitForTaskIds.length > 0) ||
+    (command.kind === 'continue_child' && command.waitForCompletion === true);
   if (wantsCompoundWait && ctx.allowedActions && !ctx.allowedActions.has('wait_for_tasks')) {
     return {
       ok: false,
@@ -1293,6 +1294,16 @@ export async function executeToolCommand(
         if (live) {
           return { ok: false, reason: 'child has a live turn; continue_child rejects live children' };
         }
+        if (
+          child.pendingParentQuestion &&
+          child.pendingParentQuestion.answers === undefined &&
+          !child.pendingParentQuestion.continuationTurnId
+        ) {
+          return {
+            ok: false,
+            reason: 'child is awaiting parent answer; only answer_child_question or cancel may advance',
+          };
+        }
         let working = child;
         if (isTerminalLifecycle(child.lifecycle)) {
           const reopened = reopenTask(child, { now });
@@ -1479,7 +1490,37 @@ export async function executeToolCommand(
             sealedBy: coordinatorSeal,
           });
           if (!cancelled.ok) return cancelled;
-          draft.tasks[taskId] = cancelled.next.task;
+          let nextTask = cancelled.next.task;
+          // Clear pending ask_parent on cancelled subtree (ISSUE-8).
+          if (nextTask.pendingParentQuestion) {
+            const qId = nextTask.pendingParentQuestion.questionId;
+            const parentId = nextTask.parentId;
+            nextTask = {
+              ...nextTask,
+              pendingParentQuestion: undefined,
+              attention:
+                nextTask.attention?.code === 'awaiting_parent_answer'
+                  ? undefined
+                  : nextTask.attention,
+            };
+            if (parentId && draft.tasks[parentId]?.pendingChildQuestions?.[qId]) {
+              const p = draft.tasks[parentId]!;
+              const nextInbound = { ...(p.pendingChildQuestions ?? {}) };
+              delete nextInbound[qId];
+              draft.tasks[parentId] = {
+                ...p,
+                pendingChildQuestions:
+                  Object.keys(nextInbound).length > 0 ? nextInbound : undefined,
+                attention:
+                  Object.keys(nextInbound).length === 0 && p.attention?.code === 'child_question'
+                    ? undefined
+                    : p.attention,
+                revision: p.revision + 1,
+                updatedAt: now,
+              };
+            }
+          }
+          draft.tasks[taskId] = nextTask;
           if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
           for (const pending of currentPending) {
             if (pending.id === currentLive?.id) continue;
@@ -1963,6 +2004,15 @@ export async function executeToolCommand(
           ...(q.options ? { options: q.options } : {}),
           ...(q.allowFreeText !== undefined ? { allowFreeText: q.allowFreeText } : {}),
         }));
+        // Release live slot: stage idle disposition so settle does not seal lifecycle;
+        // host aborts process after tool returns (caller still in live turn).
+        const liveTurn = draft.turns[ctx.turnId];
+        if (liveTurn && (liveTurn.status === 'running' || liveTurn.status === 'waiting_user')) {
+          draft.turns[ctx.turnId] = {
+            ...liveTurn,
+            disposition: liveTurn.disposition ?? { kind: 'idle' },
+          };
+        }
         draft.tasks[ctx.callerTaskId] = {
           ...child,
           pendingParentQuestion: {
@@ -1987,7 +2037,7 @@ export async function executeToolCommand(
           askedAt: now,
         };
         // Terminal parent: still record; host/UI can surface (plan ISSUE-3).
-        draft.tasks[parentId] = {
+        let parentPatch: MusterTask = {
           ...parent,
           pendingChildQuestions: inbound,
           attention:
@@ -2002,6 +2052,46 @@ export async function executeToolCommand(
           revision: parent.revision + 1,
           updatedAt: now,
         };
+        // Idle open parent without active wait: queue deterministic turn with Q payload.
+        if (
+          parent.lifecycle === 'open' &&
+          !(parent.wait?.kind === 'children' && parent.wait.phase === 'active')
+        ) {
+          const hasLive = turnsForTask(draft, parentId).some(
+            (t) => t.status === 'running' || t.status === 'waiting_user' || t.status === 'queued',
+          );
+          if (!hasLive) {
+            const qTurnId = deriveEntityId(ctx.turnId, command.opId, 'parent-q');
+            const turnCap = canCreateTurn(draft, parentId, limits);
+            if (turnCap.ok && !draft.turns[qTurnId]) {
+              const messageId = randomUUID();
+              const qLines = questions
+                .map((q, i) => `Q${i + 1}: ${q.prompt}`)
+                .join('\n');
+              draft.messages[messageId] = {
+                id: messageId,
+                taskId: parentId,
+                role: 'user',
+                content:
+                  `Child ${ctx.callerTaskId} asks (questionId=${questionId}). ` +
+                  `Call answer_child_question with this questionId.\n${qLines}`,
+                state: 'assigned',
+                createdAt: now,
+                turnId: qTurnId,
+              };
+              const cont = transitionContinueTask(parentPatch, turnsForTask(draft, parentId), {
+                turnId: qTurnId,
+                now,
+                inputs: [{ kind: 'message', messageId }],
+                trigger: 'engine',
+              });
+              if (cont.ok) {
+                draft.turns[qTurnId] = cont.next;
+              }
+            }
+          }
+        }
+        draft.tasks[parentId] = parentPatch;
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: { questionId, parentTaskId: parentId },
@@ -2010,6 +2100,17 @@ export async function executeToolCommand(
       });
       if (!commit.ok) {
         return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      // Abort child live process to free concurrency (scheduler-safe).
+      const childLive = turnsForTask(deps.store.getFile(), ctx.callerTaskId).find(
+        (t) => t.status === 'running' || t.status === 'waiting_user',
+      );
+      if (childLive && deps.ownsLease(childLive.id)) {
+        deps.liveRuns.get(childLive.id)?.controller.abort();
+      }
+      const parentQTurnId = deriveEntityId(ctx.turnId, command.opId, 'parent-q');
+      if (deps.store.getFile().turns[parentQTurnId]?.status === 'queued') {
+        deps.onScheduleTurn(parentQTurnId);
       }
       deps.onRescanSchedulableTurns?.();
       const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
@@ -2232,11 +2333,22 @@ export function projectChildResults(
   for (const id of taskIds) {
     const task = file.tasks[id];
     if (!task) continue;
+    const pendingQ =
+      task.pendingParentQuestion && !task.pendingParentQuestion.answers
+        ? {
+            questionId: task.pendingParentQuestion.questionId,
+            questions: task.pendingParentQuestion.questions.slice(0, 8).map((q) => ({
+              prompt: q.prompt.slice(0, 400),
+            })),
+          }
+        : undefined;
     const entry = {
       id: task.id,
       lifecycle: task.lifecycle,
       result: task.result?.slice(0, 512),
       error: task.error?.slice(0, 256),
+      attention: task.attention?.code,
+      ...(pendingQ ? { pendingParentQuestion: pendingQ } : {}),
     };
     const line = JSON.stringify(entry);
     const lineBytes = Buffer.byteLength(line, 'utf8') + (parts.length > 0 ? 1 : 0);

@@ -393,6 +393,14 @@ export function applySuccessfulTurn(
 
   const disposition = turn.disposition;
   if (!disposition || disposition.kind === 'idle') {
+    // Engine attention / child-question turns: no disposition expected.
+    if (turn.id.endsWith('-attention') || turn.id.includes('-child-question-')) {
+      return {
+        ok: true,
+        next: { task, turn: succeededTurn },
+        effects,
+      };
+    }
     // Pending ask_parent: never treat as missing disposition / repair (ISSUE-9).
     if (
       task.pendingParentQuestion &&
@@ -1034,7 +1042,12 @@ function allChildrenTerminal(
 
 function hasContinuationForWait(
   turns: readonly TaskTurn[],
-  wait: { kind: 'children'; taskIds: string[]; registeredByTurnId: string },
+  wait: {
+    kind: 'children';
+    taskIds: string[];
+    registeredByTurnId: string;
+    attentionContinuationTurnId?: string;
+  },
   continuationTurnId: string,
 ): boolean {
   if (turns.some((turn) => turn.id === continuationTurnId)) {
@@ -1047,6 +1060,9 @@ function hasContinuationForWait(
   return turns.some(
     (turn) =>
       turn.trigger === 'engine' &&
+      // Attention wakes must not satisfy the terminal barrier (P0.5 ask_parent ISSUE-3).
+      !turn.id.endsWith('-attention') &&
+      turn.id !== wait.attentionContinuationTurnId &&
       turn.sequence > registeringTurn.sequence &&
       turn.inputs.some(
         (input) =>

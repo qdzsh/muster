@@ -3259,7 +3259,7 @@ export class TaskEngine {
   /**
    * Host policy for dependency `onUnsatisfied: fail|skip` — not CLI-driven.
    * Seals dependents when a required dependency finished unsuccessfully.
-   * `onUnsatisfied: block` remains open + blocked via scheduler only.
+   * `onUnsatisfied: block` remains open + blocked; publish wakeable attention (P0 ISSUE-6).
    */
   private applyDependencyTerminals(): void {
     const now = nowIso(this.clock);
@@ -3267,7 +3267,32 @@ export class TaskEngine {
       for (const task of Object.values(draft.tasks)) {
         if (isTerminalLifecycle(task.lifecycle)) continue;
         const outcome = dependencyTerminalOutcome(draft, task.id);
-        if (!outcome) continue;
+        if (!outcome) {
+          // Wakeable attention for block-policy sinks that are permanently unsatisfied.
+          if (
+            (task.releaseState ?? 'draft') === 'released' &&
+            task.lifecycle === 'open' &&
+            task.dependencies.some((dep) => {
+              if (dep.onUnsatisfied !== 'block') return false;
+              const depTask = draft.tasks[dep.taskId];
+              if (!depTask || !isTerminalLifecycle(depTask.lifecycle)) return false;
+              return depTask.lifecycle !== 'succeeded';
+            }) &&
+            task.attention?.code !== 'dependency_unsatisfied'
+          ) {
+            draft.tasks[task.id] = {
+              ...task,
+              attention: {
+                code: 'dependency_unsatisfied',
+                message: 'required dependency finished unsuccessfully (block policy)',
+                at: now,
+              },
+              revision: task.revision + 1,
+              updatedAt: now,
+            };
+          }
+          continue;
+        }
         const live = Object.values(draft.turns).find(
           (t) =>
             t.taskId === task.id &&
@@ -4386,6 +4411,18 @@ export class TaskEngine {
       }
       const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
       if (!turnCap.ok) {
+        // Cannot repair: escalate to wakeable missing_disposition for parent.
+        draft.tasks[taskId] = {
+          ...task,
+          attention: {
+            code: 'missing_disposition',
+            message: 'disposition repair could not be scheduled',
+            at: now,
+            sourceTurnId: settledTurnId,
+          },
+          revision: task.revision + 1,
+          updatedAt: now,
+        };
         return { ok: true };
       }
       const messageId = randomUUID();
@@ -4409,7 +4446,18 @@ export class TaskEngine {
         trigger: 'engine',
       });
       if (!continued.ok) {
-        return continued;
+        draft.tasks[taskId] = {
+          ...task,
+          attention: {
+            code: 'missing_disposition',
+            message: 'disposition repair failed to create turn',
+            at: now,
+            sourceTurnId: settledTurnId,
+          },
+          revision: task.revision + 1,
+          updatedAt: now,
+        };
+        return { ok: true };
       }
       draft.turns[repairTurnId] = continued.next;
       return { ok: true };
@@ -4417,6 +4465,7 @@ export class TaskEngine {
     if (commit.ok && this.store.getFile().turns[repairTurnId]?.status === 'queued') {
       void this.scheduleTurn(repairTurnId);
     }
+    this.reconcileChildWaits();
   }
 
   private async settleInterrupted(
