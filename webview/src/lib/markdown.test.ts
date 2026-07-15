@@ -234,4 +234,41 @@ describe('renderMarkdown — legitimate markdown still renders', () => {
     expect(a!.getAttribute('href')).toBe('mailto:a@b.com');
     expect(a!.getAttribute('data-external-href')).toBe('mailto:a@b.com');
   });
+
+  test('workspace markdown path becomes a presentation link, not external', () => {
+    const out = renderMarkdown('[plan](docs/plans/foo.md)');
+    const dom = parse(out);
+    const a = dom.querySelector('a');
+    expect(a).not.toBeNull();
+    expect(a!.getAttribute('data-workspace-md-href')).toBe('docs/plans/foo.md');
+    expect(a!.hasAttribute('data-external-href')).toBe(false);
+    expect(a!.getAttribute('href')).toBe('docs/plans/foo.md');
+    expect(a!.className).toContain('workspace-md-link');
+  });
+
+  test('https .md URL stays external (not workspace presentation)', () => {
+    const out = renderMarkdown('[remote](https://example.com/plan.md)');
+    const dom = parse(out);
+    const a = dom.querySelector('a');
+    expect(a!.getAttribute('data-external-href')).toBe('https://example.com/plan.md');
+    expect(a!.hasAttribute('data-workspace-md-href')).toBe(false);
+  });
+
+  test('bare absolute markdown path becomes a clickable workspace-md link', () => {
+    const out = renderMarkdown(
+      'file at /Users/lploc94/projects/grok-worker/plan.md for you',
+    );
+    const dom = parse(out);
+    const a = dom.querySelector('a.workspace-md-link');
+    expect(a).not.toBeNull();
+    expect(a!.getAttribute('data-workspace-md-href')).toBe(
+      '/Users/lploc94/projects/grok-worker/plan.md',
+    );
+    expect(a!.textContent).toBe('plan.md');
+  });
+
+  test('bare path inside fenced code is not linkified', () => {
+    const out = renderMarkdown('```\n/tmp/secret.md\n```');
+    expect(out).not.toContain('data-workspace-md-href');
+  });
 });

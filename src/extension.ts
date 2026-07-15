@@ -69,6 +69,10 @@ import {
 } from './host/presentation-panel-adapter';
 import { PresentationToolRouter } from './host/presentation-tool-router';
 import { createPresentationChatLink } from './host/presentation-chat-link';
+import {
+  clampPresentationMarkdown,
+  resolveWorkspaceMarkdownPath,
+} from './host/markdown-file-presentation';
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
@@ -1017,6 +1021,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('invalid link');
       return;
     }
+    // Workspace markdown → presentation tab (not browser / text editor).
+    if (this.tryOpenWorkspaceMarkdownPresentation(url)) {
+      return;
+    }
+    // Absolute local .md outside workspace folders → open in editor.
+    if (this.tryOpenLocalMarkdownFile(url)) {
+      return;
+    }
     let parsed: vscode.Uri;
     try {
       parsed = vscode.Uri.parse(url, true);
@@ -1030,6 +1042,97 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     void vscode.env.openExternal(parsed);
+  }
+
+  /** Open absolute filesystem .md path (e.g. worker cwd outside workspace root). */
+  private tryOpenLocalMarkdownFile(url: string): boolean {
+    const trimmed = url.trim();
+    if (!/\.(md|markdown|mdx)$/i.test(trimmed.split(/[?#]/)[0] ?? '')) return false;
+    let fsPath = trimmed;
+    if (/^file:/i.test(trimmed)) {
+      try {
+        fsPath = vscode.Uri.parse(trimmed).fsPath;
+      } catch {
+        return false;
+      }
+    }
+    const isAbs =
+      fsPath.startsWith('/') ||
+      /^[A-Za-z]:[\\/]/.test(fsPath) ||
+      fsPath.startsWith('\\\\');
+    if (!isAbs) return false;
+    try {
+      if (!fs.existsSync(fsPath) || !fs.statSync(fsPath).isFile()) {
+        this.postCommandError('Markdown file not found.');
+        return true;
+      }
+    } catch {
+      this.postCommandError('Could not open markdown file.');
+      return true;
+    }
+    void vscode.commands.executeCommand('vscode.open', vscode.Uri.file(fsPath));
+    return true;
+  }
+
+  /**
+   * If `url` is a workspace-relative or file: path to `.md`/`.markdown`/`.mdx`,
+   * read it and open/reveal a presentation panel. Returns true when handled
+   * (success or user-visible failure).
+   */
+  private tryOpenWorkspaceMarkdownPresentation(url: string): boolean {
+    const roots =
+      vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).filter(Boolean) ?? [];
+    const target = resolveWorkspaceMarkdownPath(url, roots);
+    if (!target) return false;
+
+    if (!presentationManager) {
+      this.postCommandError('Presentation is not available.');
+      return true;
+    }
+
+    let markdown: string;
+    try {
+      markdown = fs.readFileSync(target.absolutePath, 'utf8');
+    } catch {
+      this.postCommandError('Could not read markdown file.');
+      return true;
+    }
+    if (!markdown.trim()) {
+      this.postCommandError('Markdown file is empty.');
+      return true;
+    }
+    markdown = clampPresentationMarkdown(markdown);
+
+    const file = taskStore?.getFile();
+    const focused = this.focusedTaskId ? file?.tasks[this.focusedTaskId] : undefined;
+    let rootId = focused?.id ?? 'workspace';
+    if (focused && file) {
+      let cur = focused;
+      while (cur.parentId) {
+        const parent = file.tasks[cur.parentId];
+        if (!parent) break;
+        cur = parent;
+      }
+      rootId = cur.id;
+    }
+    const ownerTaskId = focused?.id ?? rootId;
+
+    void presentationManager
+      .openWorkspaceDocument(rootId, {
+        presentationId: target.presentationId,
+        ownerTaskId,
+        title: target.title,
+        markdown,
+      })
+      .then((result) => {
+        if (!result.ok) {
+          this.postCommandError('Could not open presentation.');
+        }
+      })
+      .catch(() => {
+        this.postCommandError('Could not open presentation.');
+      });
+    return true;
   }
 
   /**

@@ -43,6 +43,54 @@ hljs.registerLanguage('md', markdown);
 /** Above this size we never highlight (avoids freezing the webview). */
 const MAX_HIGHLIGHT_CHARS = 20_000;
 const ALLOWED_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+/** Workspace-relative / file: paths ending in markdown — opened as presentation tabs by the host. */
+const WORKSPACE_MD_PATH = /^(?:file:\/\/\/?)?(?:\.\/)?[A-Za-z0-9_./@%+\- ]+\.(?:md|markdown|mdx)(?:[?#][^\s]*)?$/i;
+
+/** True when href is a workspace markdown path (not http/mailto). Exported for tests. */
+export function isWorkspaceMarkdownLinkHref(raw: string): boolean {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 2048 || trimmed.includes('\0')) return false;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed) && !/^file:/i.test(trimmed)) return false;
+  return WORKSPACE_MD_PATH.test(trimmed);
+}
+
+/**
+ * Bare path to a markdown file in prose (not already a markdown link).
+ * Requires a path-like prefix (/, ./, file:, or drive) so plain words are not eaten.
+ * Spaces in path segments are not supported for bare paths (use a markdown link).
+ */
+const BARE_MD_PATH =
+  /(?<!\]\()(?<!["'`=])((?:file:\/\/\/[^\s]+\.(?:md|markdown|mdx)|(?:\.\/|\/|[A-Za-z]:[\\/])[A-Za-z0-9_./@%+\-]+\.(?:md|markdown|mdx)))(?![)\w])/gi;
+
+/**
+ * Turn bare `…/plan.md` paths into markdown links so they become clickable
+ * workspace-md presentation targets after sanitize.
+ */
+export function linkifyBareMarkdownPaths(text: string): string {
+  if (!text) return text;
+  return text.replace(BARE_MD_PATH, (match, path: string, offset: number, full: string) => {
+    // Skip fenced code blocks (odd number of ``` before match).
+    const before = full.slice(0, offset);
+    const fenceCount = (before.match(/```/g) || []).length;
+    if (fenceCount % 2 === 1) return match;
+    // Skip inline code spans.
+    const lastBacktick = before.lastIndexOf('`');
+    if (lastBacktick >= 0) {
+      const afterTick = before.slice(lastBacktick + 1);
+      if (!afterTick.includes('`') && full.indexOf('`', offset) >= 0) return match;
+    }
+    // Already part of a markdown link destination.
+    if (/\]\([^)]*$/.test(before.slice(-40))) return match;
+    const href = path.trim();
+    if (!isWorkspaceMarkdownLinkHref(href) && !/^\/|^[A-Za-z]:[\\/]|^file:/i.test(href)) {
+      return match;
+    }
+    // Label: basename for long absolute paths.
+    const label = href.replace(/\\/g, '/').split('/').pop() || href;
+    return `[${label}](${href})`;
+  });
+}
 
 function escapeHtml(text: string): string {
   return text
@@ -93,6 +141,15 @@ function installHook(): void {
     if (node.nodeName === 'A') {
       const el = node as HTMLElement & { href?: string };
       const raw = el.getAttribute('href');
+      if (raw && isWorkspaceMarkdownLinkHref(raw)) {
+        // Host opens as a presentation tab (see App openLink → handleOpenLink).
+        el.setAttribute('data-workspace-md-href', raw);
+        el.setAttribute('href', raw);
+        el.setAttribute('class', [el.getAttribute('class'), 'workspace-md-link'].filter(Boolean).join(' '));
+        el.removeAttribute('target');
+        el.setAttribute('rel', 'noopener');
+        return;
+      }
       let ok = false;
       if (raw) {
         try {
@@ -124,7 +181,7 @@ const SANITIZE_CONFIG = {
     'input', // GFM task-list checkboxes (disabled)
   ],
   ALLOWED_ATTR: [
-    'href', 'target', 'rel', 'data-external-href',
+    'href', 'target', 'rel', 'data-external-href', 'data-workspace-md-href',
     'class', 'data-lang',
     'type', 'checked', 'disabled', // task-list checkboxes
     'align', // table cell alignment
@@ -139,7 +196,7 @@ export function renderMarkdown(raw: string): string {
     return '';
   }
   installHook();
-  const normalized = raw.replace(/\r\n?/g, '\n');
+  const normalized = linkifyBareMarkdownPaths(raw.replace(/\r\n?/g, '\n'));
   const html = marked.parse(normalized, { async: false }) as string;
   return DOMPurify.sanitize(html, SANITIZE_CONFIG);
 }
