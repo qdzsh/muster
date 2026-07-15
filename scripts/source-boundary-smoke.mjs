@@ -153,15 +153,19 @@ function expectCiWorkflowContract(workflowText, failures) {
     failures,
     `Expected ${workflowPath} to install dependencies with \`npm ci\` before running \`npm test\`.`,
   );
+  const hasNpmTest = hasYamlLine(workflowText, /^\s*-\s*run:\s*npm test\s*(?:#.*)?$/);
+  const hasCompile = hasYamlLine(workflowText, /^\s*-\s*run:\s*npm run compile\s*(?:#.*)?$/);
   expectCondition(
-    hasYamlLine(workflowText, /^\s*-\s*run:\s*npm test\s*(?:#.*)?$/),
+    hasNpmTest,
     failures,
     `Expected ${workflowPath} to run \`npm test\` as the shared local and CI verifier.`,
   );
+  // Allow `npm run compile` only as an additional gate after `npm test`.
+  // Reject the old compile-only CI path (compile without test).
   expectCondition(
-    !hasYamlLine(workflowText, /^\s*-\s*run:\s*npm run compile\s*(?:#.*)?$/),
+    !hasCompile || hasNpmTest,
     failures,
-    `Expected ${workflowPath} to run \`npm test\` directly instead of retaining the old \`npm run compile\` compile-only CI path.`,
+    `Expected ${workflowPath} to run \`npm test\` when using \`npm run compile\` (reject compile-only CI).`,
   );
   expectCondition(
     !hasYamlLine(workflowText, /^\s*matrix:\s*(?:#.*)?$/) && !/node-version:\s*\[/.test(workflowText),

@@ -111,7 +111,8 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   assert.match(workflow, /cache: npm/);
   assert.match(workflow, /run: npm ci/);
   assert.match(workflow, /run: npm test/);
-  assert.doesNotMatch(workflow, /run: npm run compile/);
+  // compile is allowed only after npm test (not compile-only).
+  assert.match(workflow, /run: npm run compile/);
   assert.doesNotMatch(workflow, /strategy:\n\s+matrix:/);
 });
 

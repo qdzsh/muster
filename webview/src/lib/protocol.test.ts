@@ -16,7 +16,6 @@ vi.mock('./vscode', () => ({
 import {
   PROTOCOL_VERSION,
   formatExportResultMessage,
-  formatLiveInputDeliveredMessage,
   isExtMessage,
   isProtocolCompatible,
   isTaskScopedBannerVisible,
@@ -408,7 +407,7 @@ describe('file drop outbound protocol', () => {
   });
 });
 
-describe('live-input protocol', () => {
+describe('interrupt-and-send protocol', () => {
   it('posts sendLiveInput as a distinct OutMessage from continueTask', () => {
     vi.mocked(vscode.postMessage).mockClear();
 
@@ -431,50 +430,10 @@ describe('live-input protocol', () => {
     expect(live.type).not.toBe(queued.type);
   });
 
-  it('accepts a delivered liveInputResult acknowledgement from the host', () => {
-    expect(
-      isExtMessage({
-        type: 'liveInputResult',
-        taskId: 'task-1',
-        code: 'delivered',
-        sessionId: 'sess-1',
-      }),
-    ).toBe(true);
-  });
 
-  it('rejects malformed liveInputResult shapes', () => {
-    const malformed = [
-      { type: 'liveInputResult', taskId: 'task-1', code: 'delivered' },
-      { type: 'liveInputResult', taskId: 'task-1', code: 'unsupported', sessionId: 's' },
-      { type: 'liveInputResult', taskId: 'task-1', code: 'delivered', sessionId: 's', extra: true },
-      { type: 'liveInputResult', code: 'delivered', sessionId: 's' },
-    ];
-    for (const message of malformed) {
-      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
-    }
-  });
 
-  it('keeps commandError as the visible refusal channel for live-input failures', () => {
-    expect(
-      isExtMessage({
-        type: 'commandError',
-        taskId: 'task-1',
-        message: 'Live input unsupported: backend kiro does not support live input',
-      }),
-    ).toBe(true);
-  });
 
-  it('formats a delivered live-input acknowledgement that is never empty', () => {
-    const message = formatLiveInputDeliveredMessage('sess-1');
-    expect(message.length).toBeGreaterThan(0);
-    expect(message.toLowerCase()).toContain('live input');
-    expect(message.toLowerCase()).toContain('delivered');
-  });
 
-  it('rejects blank session ids when formatting delivered acknowledgements', () => {
-    expect(() => formatLiveInputDeliveredMessage('')).toThrow(/session/i);
-    expect(() => formatLiveInputDeliveredMessage('   ')).toThrow(/session/i);
-  });
 
   it('scopes inject feedback banners to the focused task (or global when taskId is absent)', () => {
     expect(isTaskScopedBannerVisible(null, 'task-1')).toBe(true);

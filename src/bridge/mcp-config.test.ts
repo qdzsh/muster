@@ -8,7 +8,6 @@ const MCP_CAPS = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false,
 };
 
 describe('buildTurnMcp', () => {

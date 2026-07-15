@@ -1,6 +1,8 @@
 # Muster Bridge — MCP Server (`muster_bridge`)
 
-This document is the **authoritative design** for the extension-owned MCP server `muster_bridge`: human-in-the-loop tools and IDE bridge capabilities that non-interactive ACP coordinator mode cannot provide alone.
+This document is the **authoritative design** for the extension-owned MCP server `muster_bridge`: coordinator task tools and IDE bridge capabilities.
+
+**Status note (2026-07-15 cleanup):** MCP tool **`ask_user` is removed** from the catalog. Root agents use **ACP RFD `elicitation/create`** (form/url). Non-root workers use **`ask_parent`**. Grok’s vendor `x.ai/ask_user_question` still maps through **AskBridge** → AskCard (not MCP `ask_user`). Historical sections below that describe MCP `ask_user` as the product path are **superseded** by that policy.
 
 **Related docs:**
 - `docs/DESIGN.md` — high-level architecture (§2.5, §5, §8)

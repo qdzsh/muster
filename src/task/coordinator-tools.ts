@@ -114,7 +114,6 @@ export type ToolCommand =
       /** Wait only this explicit subset of released/owned direct children. */
       waitForTaskIds?: string[];
     }
-  | { kind: 'start_task'; opId: string; childId: string }
   | { kind: 'interrupt_task'; opId: string; childId: string }
   | { kind: 'cancel_task'; opId: string; childId: string }
   | { kind: 'cancel_tasks'; opId: string; childIds: string[]; reason?: string }
@@ -165,7 +164,6 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'create_tasks',
   'delegate_tasks',
   'release_tasks',
-  'start_task',
   'interrupt_task',
   'cancel_task',
   'cancel_tasks',
@@ -175,7 +173,6 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'complete_task',
   'fail_task',
   'report_progress',
-  'ask_user',
   'ask_parent',
   'answer_child_question',
   'upsert_presentation',
@@ -188,8 +185,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'create_tasks',
     'delegate_tasks',
     'release_tasks',
-    'start_task',
-    'interrupt_task',
+      'interrupt_task',
     'cancel_task',
     'cancel_tasks',
     'continue_child',
@@ -201,8 +197,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'complete_task',
     'fail_task',
     'report_progress',
-    'ask_user',
-    'ask_parent',
+      'ask_parent',
     'answer_child_question',
     'upsert_presentation',
   ];
@@ -695,13 +690,6 @@ export function dispatch(
             ...(waitForTaskIds !== undefined ? { waitForTaskIds } : {}),
           },
         };
-      }
-      case 'start_task': {
-        const childId = requireString(args, 'childId') ?? requireString(args, 'taskId');
-        if (!childId) {
-          return { ok: false, toolError: 'childId is required' };
-        }
-        return { ok: true, command: { kind: 'start_task', opId, childId } };
       }
       case 'interrupt_task': {
         const childId = requireString(args, 'childId') ?? requireString(args, 'taskId');

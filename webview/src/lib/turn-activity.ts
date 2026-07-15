@@ -117,8 +117,9 @@ export function turnActivityStateFromHost(activity: TurnActivity | undefined): T
 }
 
 /**
- * Host-authoritative `currentTurnActivity` (protocol v3). Optional local
- * askPending may only promote chrome to waiting_you while a card is open.
+ * Host-authoritative `currentTurnActivity` (protocol v3).
+ * Missing key → neutral (`null`) — never invent failed_turn/uncertain from runtime.
+ * Optional local askPending may only promote chrome to waiting_you while a card is open.
  */
 export function turnActivityFromTask(
   task: Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'> & {
@@ -133,13 +134,10 @@ export function turnActivityFromTask(
     }
     return fromHost;
   }
-  // Draft / pre-host path only.
-  return deriveTurnActivityState({
-    lifecycle: task.lifecycle,
-    runtimeActivity: effectiveRuntimeActivity(task),
-    threadRunning: opts?.threadRunning,
-    askPending: opts?.askPending,
-  });
+  // Absent host activity: neutral only (no client-derived recovery chrome).
+  if (opts?.askPending) return 'waiting_you';
+  if (opts?.threadRunning) return 'executing';
+  return 'null';
 }
 
 export function getTurnActivityPresentation(

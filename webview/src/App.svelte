@@ -11,7 +11,6 @@
   import {
     effectiveRuntimeActivity,
     formatExportResultMessage,
-    formatLiveInputDeliveredMessage,
     isExtMessage,
     isProtocolCompatible,
     isTaskScopedBannerVisible,
@@ -498,13 +497,6 @@
           }
           break;
         }
-
-        case 'liveInputResult':
-          // Delivered acks must not be silently dropped; refusals use commandError.
-          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
-            tasks.setCommandNotice(formatLiveInputDeliveredMessage(msg.sessionId), msg.taskId);
-          }
-          break;
 
         case 'exportResult':
           // Success notice is task-scoped; basename-only fileName + sourceRevision.

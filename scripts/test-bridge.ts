@@ -8,13 +8,13 @@ import { MusterBridgeServer } from '../src/bridge/server';
 import { deriveEntityId } from '../src/task/engine-graph';
 import { TaskEngine } from '../src/task/engine';
 import { TaskStore } from '../src/task/store';
+import { parseTaskTypeRegistry } from '../src/task/task-types';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../src/types';
 
 const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false,
 };
 
 async function runBridgeToolAgent(url: string, token: string, script: string): Promise<void> {
@@ -96,12 +96,16 @@ async function main(): Promise<void> {
   });
   const { port } = await server.listen();
 
+  const taskTypes = parseTaskTypeRegistry({
+    worker: { backend: 'grok', role: 'worker', briefKind: 'generic' },
+  });
   engine = TaskEngine.load({
     store,
     makeBackend: () => backend,
     askBridge,
     credentialRegistry: credentials,
     bridgePort: port,
+    getTaskTypeRegistry: () => taskTypes,
   });
 
   const created = engine.createTask({

@@ -3,7 +3,7 @@
  * Env: MUSTER_BRIDGE_URL, MUSTER_BRIDGE_TOKEN, MUSTER_TOOL_SCRIPT
  *   - JSON array of {tool,args}
  *   - "coord-initial" — delegate_task + wait_for_tasks
- *   - "coord-continuation" — ask_user only
+ *   - "coord-continuation" — report_progress + complete_task
  */
 const bridgeUrlEnv = process.env.MUSTER_BRIDGE_URL;
 const tokenEnv = process.env.MUSTER_BRIDGE_TOKEN;
@@ -119,7 +119,13 @@ async function runCoordInitial(sessionId: string | undefined, startId: number): 
 
   const delegated = await callTool(sid, id, {
     tool: 'delegate_task',
-    args: { opId: 'd1', goal: 'child work', backend: 'grok', role: 'worker' },
+    args: {
+      opId: 'd1',
+      goal: 'child work',
+      taskType: 'worker',
+      backend: 'grok',
+      role: 'worker',
+    },
   });
   sid = delegated.sessionId;
   id = delegated.nextId;
@@ -136,12 +142,14 @@ async function runCoordInitial(sessionId: string | undefined, startId: number): 
 }
 
 async function runCoordContinuation(sessionId: string | undefined, startId: number): Promise<void> {
-  await callTool(sessionId, startId, {
-    tool: 'ask_user',
-    args: {
-      opId: 'a1',
-      questions: [{ prompt: 'Proceed?', options: ['yes', 'no'], allowFreeText: false }],
-    },
+  // MCP ask_user removed — continuation path reports progress then completes.
+  const progress = await callTool(sessionId, startId, {
+    tool: 'report_progress',
+    args: { opId: 'p1', note: 'continuation after child_results' },
+  });
+  await callTool(progress.sessionId, progress.nextId, {
+    tool: 'complete_task',
+    args: { opId: 'c-cont', result: 'coord done after children' },
   });
 }
 

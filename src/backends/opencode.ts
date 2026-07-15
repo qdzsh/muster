@@ -1,13 +1,11 @@
 import {
   Backend,
   BackendCapabilities,
-  LiveInputRequest,
-  LiveInputResult,
   NormalizedEvent,
   RunOptions,
 } from '../types';
 import { AcpAgentConfig, disposeSharedAcpClient } from './acp-client';
-import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn, sendAcpLiveInput } from './acp-run';
+import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn } from './acp-run';
 
 export { disposeSharedAcpClient };
 
@@ -60,9 +58,5 @@ export class OpenCodeBackend implements Backend {
 
   run(options: RunOptions): AsyncIterable<NormalizedEvent> {
     return runAcpTurn(OPENCODE_SPEC, options);
-  }
-
-  sendLiveInput(request: LiveInputRequest): Promise<LiveInputResult> {
-    return sendAcpLiveInput(OPENCODE_SPEC, request);
   }
 }

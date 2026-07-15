@@ -1,11 +1,5 @@
 import { randomUUID } from 'crypto';
-import {
-  BackendCapabilities,
-  LiveInputRequest,
-  LiveInputResult,
-  NormalizedEvent,
-  RunOptions,
-} from '../types';
+import { BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import {
   AcpAgentConfig,
   type AcpModelConfig,
@@ -69,9 +63,6 @@ export const ACP_CAPABILITIES: BackendCapabilities = {
   supportsReasoning: true,
   supportsDetailedToolEvents: true,
   supportsMCP: true,
-  // All ACP adapters expose sendLiveInput; policy B always attempts the wire
-  // call when a prompt is in flight (capability advertise is advisory only).
-  supportsLiveInput: true,
 };
 
 function cancellationTerminal(): NormalizedEvent {
@@ -376,16 +367,4 @@ export async function* runAcpTurn(
     unregister?.();
     unregisterConnection?.();
   }
-}
-
-/**
- * Route a live-input request through the shared ACP client for this adapter.
- * Capability evidence is enforced inside {@link AcpClient.sendLiveInput}.
- */
-export async function sendAcpLiveInput(
-  spec: AcpAdapterSpec,
-  request: LiveInputRequest,
-): Promise<LiveInputResult> {
-  const client = getSharedAcpClient(spec.makeConfig());
-  return client.sendLiveInput(request);
 }

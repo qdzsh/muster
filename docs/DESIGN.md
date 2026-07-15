@@ -19,7 +19,7 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
   - Tool calls (start + result)
   - Final messages
 - Allow the agent to use a custom **MCP "context engine"** tool during execution (semantic codebase search, etc.).
-- Let the agent **ask the user** mid-turn via MCP `muster_bridge.ask_user` (see `docs/MUSTER-BRIDGE.md`).
+- Let the agent **ask the user** mid-turn via **ACP RFD elicitation** (root) or **`ask_parent`** (children). See `docs/MUSTER-BRIDGE.md`.
 
 ### Explicitly Out of Scope (for now)
 - Rich permission system / approval cards
@@ -58,10 +58,10 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
 - Updates are mapped into a small set of **normalized events**.
 - The UI only deals with the normalized model (makes it easy to add new backends later).
 
-### 2.5 Human-in-the-Loop via Muster Bridge (MCP `ask_user`)
-- Agents ask structured questions through MCP tool `ask_user` on server `muster_bridge` — **MCP only**, no text/JSON fallback.
-- The **extension host** owns `AskBridge` (in-memory pending asks). The **webview** submits answers via `postMessage`; it does not call MCP directly.
-- Preferred transport: **HTTP MCP URL** served locally by the extension. stdio MCP + localhost callback is a fallback.
+### 2.5 Human-in-the-Loop (ACP elicitation + ask_parent)
+- **Root agents** request structured input via ACP RFD `elicitation/create` (form/url). Grok vendor `x.ai/ask_user_question` maps through AskBridge → AskCard.
+- **Non-root workers** use MCP **`ask_parent`** (parent answers with `answer_child_question`). MCP **`ask_user` is removed**.
+- The **extension host** owns elicitation/Ask bridges. The **webview** submits answers via `postMessage`; it does not call MCP directly.
 - A turn remains **one ACP session per user message**, but the session may **pause** until the user answers (not a session pool).
 - **All five ACP backends implemented** (Grok, Kiro, OpenCode, Claude, Codex) on the shared `acp-client.ts`; agy follows the same client when its ACP entry exists.
 
@@ -124,7 +124,7 @@ Extension
 ├── CommandBuilder / MCPConfig helpers
 ├── Muster Bridge
 │   ├── AskBridge (pending asks, in-memory)
-│   └── MusterMcpHttpServer (local HTTP MCP — `ask_user`)
+│   └── MusterMcpHttpServer (local HTTP MCP — coordinator tools)
 ├── acp-client.ts (shared ACP JSON-RPC client per backend agent process)
 ├── Runner (ACP session lifecycle + session/update → NormalizedEvent)
 └── UI (Webview)
@@ -164,9 +164,9 @@ behavior.
 Each turn merges **two** MCP servers (details in `MCP-INJECTION.md`):
 
 1. **`context_engine`** — user-provided semantic search / codebase tools (stdio).
-2. **`muster_bridge`** — extension-owned `ask_user` for human-in-the-loop (`MUSTER-BRIDGE.md`).
+2. **`muster_bridge`** — extension-owned coordinator tools (task graph, status, disposition). Human ask is **not** MCP `ask_user` — use ACP elicitation / `ask_parent` (`MUSTER-BRIDGE.md`).
 
-At turn start we generate/pass a merged MCP config (or use per-CLI discovery). Goal: agents can search context **and** ask the user without leaving the turn.
+At turn start we generate/pass a merged MCP config (or use per-CLI discovery). Goal: agents can search context and manage tasks without leaving the turn.
 
 ## 8. Implementation Roadmap (Suggested)
 
@@ -175,7 +175,7 @@ At turn start we generate/pass a merged MCP config (or use per-CLI discovery). G
 3. **Command builders** for all 4 CLIs (with MCP injection)
 4. **ACP client + event mapper** — Grok first (done), then Claude/Codex/agy on the same path
 5. **Minimal webview** that consumes normalized events
-6. **Muster Bridge** — `AskBridge` + HTTP MCP `ask_user` (Claude first)
+6. **Muster Bridge** — coordinator MCP + ACP elicitation / AskBridge
 7. **Codex backend**
 8. **Antigravity (agy) backend** — deferred for ask UI until streaming tool events improve
 9. Polish: error handling, cancellation, version detection, raw event logging
@@ -183,7 +183,7 @@ At turn start we generate/pass a merged MCP config (or use per-CLI discovery). G
 ## 9. Risks & Open Questions
 
 - Shared ACP agent blast radius (one crashed agent process affects all in-flight sessions on that backend).
-- Antigravity ACP entry point unverified (agy `ask_user` spike OK on legacy path — see `MUSTER-BRIDGE.md` §7).
+- Antigravity ACP entry point unverified (see `MUSTER-BRIDGE.md` §7).
 - stdio MCP servers (`context_engine`) need http/sse proxy for ACP injection — Muster Bridge is already http.
 - ACP `session/update` schema drift across CLI versions.
 
@@ -192,7 +192,7 @@ At turn start we generate/pass a merged MCP config (or use per-CLI discovery). G
 - Grok Build VS Code plugin study (`study/grok-build-vscode-src/`)
 - [Agent Client Protocol](https://agentclientprotocol.com) spec + per-CLI ACP entry commands (`CLI-COMMANDS.md`)
 - Model Context Protocol (MCP) specification
-- `docs/MUSTER-BRIDGE.md` — MCP `ask_user` + AskBridge design
+- `docs/MUSTER-BRIDGE.md` — bridge / elicitation / coordinator tools
 
 ---
 

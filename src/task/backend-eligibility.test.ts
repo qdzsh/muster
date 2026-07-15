@@ -8,7 +8,6 @@ describe('canBindTaskToBackend', () => {
         supportsReasoning: false,
       supportsDetailedToolEvents: false,
       supportsMCP: true,
-      supportsLiveInput: false
       }),
     ).toBe(true);
   });
@@ -19,7 +18,6 @@ describe('canBindTaskToBackend', () => {
         supportsReasoning: true,
       supportsDetailedToolEvents: true,
       supportsMCP: false,
-      supportsLiveInput: false
       }),
     ).toBe(false);
   });

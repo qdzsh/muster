@@ -17,7 +17,6 @@ vi.mock('./vscode', () => ({
 }));
 
 import {
-  formatLiveInputDeliveredMessage,
   isExtMessage,
   isTaskScopedBannerVisible,
   type OutMessage,
@@ -134,27 +133,5 @@ describe('live-input host protocol (S01 integration surface)', () => {
     expect(live.type).not.toBe('continueTask');
   });
 
-  it('accepts delivered liveInputResult and commandError refusal shapes', () => {
-    expect(
-      isExtMessage({
-        type: 'liveInputResult',
-        taskId: 'task-1',
-        code: 'delivered',
-        sessionId: 'sess-1',
-      }),
-    ).toBe(true);
-    expect(
-      isExtMessage({
-        type: 'commandError',
-        taskId: 'task-1',
-        message: 'Live input unsupported: no capability',
-      }),
-    ).toBe(true);
-  });
 
-  it('formats delivered live-input acknowledgements for the App notice banner', () => {
-    expect(formatLiveInputDeliveredMessage('sess-1').toLowerCase()).toContain('delivered');
-    expect(isTaskScopedBannerVisible('task-1', 'task-1')).toBe(true);
-    expect(isTaskScopedBannerVisible('task-1', 'other')).toBe(false);
-  });
 });

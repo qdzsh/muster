@@ -1,6 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { createInterface, Interface } from 'readline';
-import { LiveInputRequest, LiveInputResult, McpServerConfig } from '../types';
+import { McpServerConfig } from '../types';
 import type {
   AgentQuestion,
   ElicitationAction,
@@ -164,8 +164,6 @@ type ConnectionSink = (line: string, source: 'stderr' | 'non-json') => void;
 
 /**
  * Shape of the ACP `initialize` response fields the client relies on.
- * Live-input support is proven only from agent-advertised capability evidence
- * (never assumed from backend id alone).
  */
 export interface AcpInitializeResult {
   authMethods?: { id: string }[];
@@ -175,41 +173,17 @@ export interface AcpInitializeResult {
       image?: boolean;
       audio?: boolean;
       embeddedContext?: boolean;
-      /** Agent accepts concurrent in-flight prompts for mid-turn steering. */
-      liveInput?: boolean;
     };
     sessionCapabilities?: {
-      liveInput?: boolean;
       [key: string]: unknown;
     };
-    /** Some agents advertise live input only under `_meta`. */
     _meta?: {
-      liveInput?: boolean;
       [key: string]: unknown;
     };
     [key: string]: unknown;
   };
 }
 
-/**
- * Derive live-input capability evidence from an ACP `initialize` result.
- * Used for diagnostics only — policy B always attempts inject regardless.
- */
-export function deriveLiveInputSupport(init: AcpInitializeResult | null | undefined): boolean {
-  const caps = init?.agentCapabilities;
-  if (!caps) return false;
-  if (caps.promptCapabilities?.liveInput === true) return true;
-  if (caps.sessionCapabilities?.liveInput === true) return true;
-  if (caps._meta?.liveInput === true) return true;
-  return false;
-}
-
-/**
- * ACP wire method used for mid-turn live input when capability evidence is present.
- * Concurrent `session/prompt` to the same session while a prior prompt is pending
- * is the backend-supported path (not a queue-priority side channel).
- */
-export const LIVE_INPUT_METHOD = 'session/prompt' as const;
 
 /** Auth choice returned by a backend's {@link AcpAgentConfig.resolveAuth}. */
 export interface AcpAuthChoice {
@@ -570,18 +544,6 @@ export class AcpClient {
   private extraEnv?: Record<string, string>;
   private authenticated = false;
   loadSessionSupported = false;
-  /**
-   * True when `initialize` advertised live-input capability evidence.
-   * Advisory only — Muster always *attempts* mid-turn inject (policy B);
-   * failures fall back to ordinary send at the host. This flag remains for
-   * diagnostics / future UI "inject vs queue" hints.
-   */
-  liveInputSupported = false;
-  /**
-   * Count of in-flight `session/prompt` requests per session. Live input is
-   * only meaningful while at least one prompt is pending for that session.
-   */
-  private activePromptCounts = new Map<string, number>();
 
   constructor(private readonly config: AcpAgentConfig) {}
 
@@ -674,91 +636,14 @@ export class AcpClient {
     await this.ensureConnected();
     // Keep the request id so bounded cancellation can drop the pending entry
     // (and clear its 30-minute timeout) when force-settling a hung turn.
-    this.trackPromptStart(sessionId);
-    const { id, promise } = this.sendRequest(LIVE_INPUT_METHOD, {
+    const { id, promise } = this.sendRequest('session/prompt', {
       sessionId,
       prompt: [{ type: 'text', text }],
     });
-    const tracked = (promise as Promise<PromptResult>).finally(() => {
-      this.trackPromptEnd(sessionId);
-    });
-    return boundedPromptCancel(tracked, signal, {
+    return boundedPromptCancel(promise as Promise<PromptResult>, signal, {
       onCancel: () => this.cancel(sessionId),
       onForceSettle: () => this.dropPending(id),
     });
-  }
-
-  /**
-   * Deliver an instruction to a live session while its primary prompt is pending.
-   *
-   * Policy B (always-try): do **not** refuse solely because initialize omitted
-   * liveInput capability. Always attempt concurrent `session/prompt` when a
-   * primary prompt is in flight. Host maps non-delivered results to silent send.
-   *
-   * Refusals that still apply before wire send:
-   * - `no-active-turn` when no prompt is in flight for the session
-   * - `cancelled` when the caller signal is already aborted
-   * - `rejected` on connect/agent/transport errors or malformed responses
-   *
-   * Does not create queue state; only talks to the exact session over ACP.
-   */
-  async sendLiveInput(request: LiveInputRequest): Promise<LiveInputResult> {
-    const sessionId = request.sessionId?.trim() ?? '';
-    const instruction = request.instruction ?? '';
-    if (!sessionId) {
-      return { code: 'rejected', reason: 'sessionId is required for live input' };
-    }
-    if (!instruction.trim()) {
-      return { code: 'rejected', reason: 'instruction is required for live input' };
-    }
-    if (request.signal?.aborted) {
-      return { code: 'cancelled', reason: 'live input cancelled before dispatch' };
-    }
-
-    try {
-      await this.ensureConnected();
-    } catch (err) {
-      return {
-        code: 'rejected',
-        reason: (err as Error).message || `${this.config.label} agent is not connected`,
-      };
-    }
-
-    // Capability advertisement is advisory only (policy B). Always attempt
-    // inject when a primary prompt is in flight.
-
-    if (!this.hasActivePrompt(sessionId)) {
-      return {
-        code: 'no-active-turn',
-        reason: `no in-flight prompt for session ${sessionId}`,
-      };
-    }
-
-    // Race cancellation against the live-input request so abort during dispatch
-    // surfaces as cancelled rather than hanging on the agent response.
-    try {
-      const result = await this.awaitLiveInputDispatch(sessionId, instruction, request.signal);
-      if (result === 'cancelled') {
-        return { code: 'cancelled', reason: 'live input cancelled during dispatch' };
-      }
-      // A successful JSON-RPC result (even empty) means the agent accepted the
-      // in-flight input. Malformed/null results are rejected below.
-      if (result == null || typeof result !== 'object') {
-        return { code: 'rejected', reason: 'malformed live-input response from agent' };
-      }
-      return { code: 'delivered', sessionId };
-    } catch (err) {
-      const message = (err as Error).message || 'live input failed';
-      if (request.signal?.aborted || /abort|cancel/i.test(message)) {
-        return { code: 'cancelled', reason: message };
-      }
-      return { code: 'rejected', reason: message };
-    }
-  }
-
-  /** True when at least one `session/prompt` is pending for the session. */
-  hasActivePrompt(sessionId: string): boolean {
-    return (this.activePromptCounts.get(sessionId) ?? 0) > 0;
   }
 
   cancel(sessionId: string): void {
@@ -766,62 +651,6 @@ export class AcpClient {
     this.notify('session/cancel', { sessionId });
   }
 
-  private trackPromptStart(sessionId: string): void {
-    this.activePromptCounts.set(sessionId, (this.activePromptCounts.get(sessionId) ?? 0) + 1);
-  }
-
-  private trackPromptEnd(sessionId: string): void {
-    const next = (this.activePromptCounts.get(sessionId) ?? 0) - 1;
-    if (next <= 0) this.activePromptCounts.delete(sessionId);
-    else this.activePromptCounts.set(sessionId, next);
-  }
-
-  private awaitLiveInputDispatch(
-    sessionId: string,
-    instruction: string,
-    signal?: AbortSignal,
-  ): Promise<unknown | 'cancelled'> {
-    // Concurrent session/prompt while a primary prompt is pending (policy B:
-    // always attempt; host falls back to send if the agent rejects).
-    const { id, promise } = this.sendRequest(LIVE_INPUT_METHOD, {
-      sessionId,
-      prompt: [{ type: 'text', text: instruction }],
-    });
-
-    if (!signal) return promise;
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const onAbort = (): void => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener('abort', onAbort);
-        // Drop the JSON-RPC pending entry so abort does not leave a 30-minute
-        // timeout / unresolved map entry after the outer promise resolves.
-        this.dropPending(id);
-        resolve('cancelled');
-      };
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      signal.addEventListener('abort', onAbort);
-      promise.then(
-        (result) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener('abort', onAbort);
-          resolve(result);
-        },
-        (err) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener('abort', onAbort);
-          reject(err);
-        },
-      );
-    });
-  }
 
   dispose(): void {
     this.teardownProcess();
@@ -905,7 +734,6 @@ export class AcpClient {
       })) as AcpInitializeResult;
 
       this.loadSessionSupported = !!init.agentCapabilities?.loadSession;
-      this.liveInputSupported = deriveLiveInputSupport(init);
 
       if (this.config.resolveAuth) {
         const choice = this.config.resolveAuth(init, env);

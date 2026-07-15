@@ -101,7 +101,6 @@
     if (pendingAsk || taskStatus === 'waiting_user') return 'waiting_you';
     if (thread.running || taskStatus === 'running') return 'executing';
     if (taskStatus === 'queued') return 'queued';
-    if (taskStatus === 'needs_recovery') return 'failed_turn';
     return 'null';
   });
   const turnPresentation = $derived(
@@ -1464,8 +1463,6 @@
             <span class="codicon codicon-debug-line-by-line"></span>
           </button>
         {/if}
-      {:else if (runtime === 'needs_recovery' || taskStatus === 'needs_recovery') && !turnId}
-        <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
       {:else if mode === 'draft' && thread.running}
         <button
           type="button"

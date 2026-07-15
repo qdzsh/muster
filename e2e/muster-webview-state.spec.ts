@@ -3073,7 +3073,7 @@ test('integrated acceptance matrix for assembled file mention autocomplete', asy
  * End-to-end user journey with real typing + mouse/keyboard activation across
  * @ / @../ / @../../, nested refinement, stale rejection, dual text/llmText,
  * task focus changes, Add Context + file-drop regressions, normal send,
- * queued follow-up, and live-input preservation.
+ * queued follow-up, and interrupt-and-send.
  * Playwright browser proof only — native Extension Development Host remains
  * ENVIRONMENT BLOCKED (see docs/uat/m011-s04/file-mention-autocomplete-live-host-evidence.md).
  */
@@ -3454,7 +3454,7 @@ test('final integrated file mention flow', async ({ page }) => {
   });
   await expect(taskBComposer).toHaveValue('');
 
-  // ── Queued follow-up + live-input preservation while running ─────────────
+  // ── Queued follow-up + interrupt-and-send while running ──────────────────
   await postSnapshot(page, {
     type: 'snapshot',
     rootTasks: [task({ id: 'task-final-live', goal: 'Final live work', viewStatus: 'running' })],
@@ -3528,7 +3528,7 @@ test('final integrated file mention flow', async ({ page }) => {
     (await postedMessages(page)).filter((m) => (m as { type?: string }).type === 'sendLiveInput'),
   ).toHaveLength(0);
 
-  // Ctrl+Enter posts sendLiveInput only (live-input path preserved).
+  // Ctrl+Enter posts sendLiveInput (interrupt & send).
   await liveComposer.fill('Inject now');
   await liveComposer.press('Control+Enter');
   await expectPostedMessage(page, {
@@ -3544,19 +3544,6 @@ test('final integrated file mention flow', async ({ page }) => {
         (m as { text?: string }).text === 'Inject now',
     ),
   ).toHaveLength(0);
-
-  // Live-input delivery notice remains task-scoped success chrome.
-  await postRawHostMessage(page, {
-    type: 'liveInputResult',
-    taskId: 'task-final-live',
-    code: 'delivered',
-    sessionId: 'sess-final',
-  });
-  const notice = page.locator('.task-command-notice');
-  await expect(notice).toBeVisible();
-  await expect(
-    notice.getByText('Live input delivered to the active session.', { exact: true }),
-  ).toBeVisible();
 
   // Browser diagnostics must stay clean for the assembled journey.
   expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
@@ -4372,7 +4359,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       ),
     ).toHaveLength(0);
 
-    // Explicit interrupt-and-send control uses the same live-input path.
+    // Explicit interrupt-and-send control uses the same sendLiveInput path.
     await composer.fill('Inject via button');
     await liveInject.click();
     await expectPostedMessage(page, {
@@ -4434,64 +4421,6 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect.poll(async () => composer.inputValue()).toMatch(/Line one/);
   });
 
-  test('surfaces liveInputResult delivery notice without treating inject unavailability as failure chrome', async ({
-    page,
-  }) => {
-    await openWebview(page);
-
-    await postSnapshot(page, {
-      type: 'snapshot',
-      rootTasks: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
-      focusedTaskId: 'task-live',
-      subtree: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
-      activeTurnId: 'turn-live',
-      storeRevision: 110,
-    });
-
-    await postRawHostMessage(page, {
-      type: 'liveInputResult',
-      taskId: 'task-live',
-      code: 'delivered',
-      sessionId: 'sess-abc',
-    });
-
-    const notice = page.locator('.task-command-notice');
-    await expect(notice).toBeVisible();
-    // Shared task-scoped notice chrome uses a generic Status title; detail carries the ack.
-    await expect(notice.getByText('Status', { exact: true })).toBeVisible();
-    await expect(
-      notice.getByText('Live input delivered to the active session.', { exact: true }),
-    ).toBeVisible();
-    await expect(page.getByRole('alert')).toHaveCount(0);
-
-    // Malformed liveInputResult (missing sessionId) must not invent a banner.
-    await postRawHostMessage(page, {
-      type: 'liveInputResult',
-      taskId: 'task-live',
-      code: 'delivered',
-    });
-    await expect(
-      notice.getByText('Live input delivered to the active session.', { exact: true }),
-    ).toBeVisible();
-
-    // Capability refusals are no longer red task-command-failed banners (host falls back to send).
-    // Unrelated command errors still show when the host posts them for other reasons.
-    await postCommandError(page, {
-      type: 'commandError',
-      taskId: 'task-live',
-      message: 'message cannot be empty',
-    });
-    await expect(page.getByRole('alert').getByText('Task command failed')).toBeVisible();
-    await expect(page.getByRole('alert').getByText('message cannot be empty')).toBeVisible();
-
-    // Foreign-task errors stay hidden while focused elsewhere.
-    await postCommandError(page, {
-      type: 'commandError',
-      taskId: 'other-task',
-      message: 'Foreign inject refusal.',
-    });
-    await expect(page.getByRole('alert').getByText('Foreign inject refusal.')).toHaveCount(0);
-  });
 
   test('queuedTurns panel supports edit/delete and shows stale mutation feedback', async ({ page }) => {
     await openWebview(page);

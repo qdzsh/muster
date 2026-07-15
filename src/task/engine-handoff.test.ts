@@ -31,7 +31,6 @@ const MCP_CAPS: BackendCapabilities = {
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
   supportsMCP: true,
-  supportsLiveInput: false,
 };
 
 function scriptedBackend(
@@ -733,7 +732,6 @@ describe('TaskEngine.requestRuntimeHandoff (always best-effort summary)', () => 
                 supportsReasoning: false,
                 supportsDetailedToolEvents: false,
                 supportsMCP: false,
-                supportsLiveInput: false,
               }
             : MCP_CAPS,
         ),

@@ -123,8 +123,7 @@
   const showFailedTurnCard = $derived(
     !!focused &&
       focused.lifecycle === 'open' &&
-      (focused.currentTurnActivity?.state === 'failed_turn' ||
-        (focused.currentTurnActivity === undefined && runtime === 'needs_recovery')),
+      focused.currentTurnActivity?.state === 'failed_turn',
   );
   const showUncertainCard = $derived(
     !!focused &&

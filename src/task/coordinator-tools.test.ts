@@ -141,7 +141,7 @@ describe('coordinator-tools dispatch', () => {
     const result = dispatch(
       'create_task',
       { opId: 'op-1', goal: 'child goal', taskType: 'worker', backend: 'grok' },
-      ctx(['create_task', 'ask_user']),
+      ctx(['create_task', 'complete_task']),
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -271,7 +271,7 @@ describe('coordinator-tools dispatch', () => {
   });
 
   it('rejects missing opId', () => {
-    const result = dispatch('start_task', { childId: 'c1' }, ctx(['start_task']));
+    const result = dispatch('complete_task', { summary: 'done' }, ctx(['complete_task']));
     expect(result).toEqual({ ok: false, toolError: 'opId is required' });
   });
 
@@ -279,7 +279,7 @@ describe('coordinator-tools dispatch', () => {
     const result = dispatch(
       'create_task',
       { opId: 'op-1', goal: 'g', taskType: 'worker', backend: 'grok' },
-      ctx(['ask_user']),
+      ctx(['complete_task']),
     );
     expect(result).toEqual({ ok: false, toolError: 'action not permitted: create_task' });
   });
@@ -641,7 +641,7 @@ describe('coordinator-tools batch dispatch', () => {
     const result = dispatch(
       'create_tasks',
       { opId: 'op-batch', tasks: [{ localId: 'a', goal: 'x', taskType: 'plan' }] },
-      ctx(['ask_user']),
+      ctx(['complete_task']),
     );
     expect(result).toEqual({ ok: false, toolError: 'action not permitted: create_tasks' });
   });

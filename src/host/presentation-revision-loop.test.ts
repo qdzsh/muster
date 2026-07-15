@@ -19,7 +19,6 @@ const capabilities: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false
 };
 
 class LoopPanel implements PresentationPanel {

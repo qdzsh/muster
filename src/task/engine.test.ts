@@ -28,7 +28,6 @@ const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false
 };
 
 function scriptedBackend(events: NormalizedEvent[], caps: BackendCapabilities = MCP_CAPS): Backend {
@@ -199,7 +198,6 @@ describe('TaskEngine', () => {
         supportsMCP: false,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false
       }),
     });
     const result = engine.createTask({ goal: 'x', backend: 'fake' });
@@ -439,6 +437,72 @@ describe('TaskEngine', () => {
     expect(impl?.attention?.code).toBe('missing_input');
     expect(store.getFile().turns[started.value.turnId].status).toBe('queued');
     expect(store.getFile().turns[started.value.turnId].resolvedInputs).toBeUndefined();
+  });
+
+  it('C5: dependency_unsatisfied attention is set when block-policy dep fails', async () => {
+    const { store } = makeTempStore();
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run() {
+        yield { type: 'sessionStarted', sessionId: 'sess-dep' };
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    const policy = {
+      maxTurns: 10,
+      maxAutomaticRetries: 0,
+      turnTimeoutMs: 60_000,
+      taskTimeoutMs: 120_000,
+    };
+    store.commit((draft) => {
+      draft.tasks.plan = {
+        id: 'plan',
+        role: 'worker',
+        lifecycle: 'failed',
+        goal: 'plan',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        releaseState: 'released',
+        error: 'plan failed',
+        finishedAt: '2026-07-06T12:00:00.000Z',
+        revision: 1,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.tasks.impl = {
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'implement',
+        parentId: null,
+        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        releaseState: 'released',
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+    // Queue a first turn so scheduleTurn/applyDependencyTerminals run on the blocked sink.
+    const implStarted = engine.startTask('impl', []);
+    expect(implStarted.ok).toBe(true);
+    if (!implStarted.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const impl = store.getTask('impl');
+    expect(impl?.attention?.code).toBe('dependency_unsatisfied');
+    expect(store.getFile().turns[implStarted.value.turnId]?.status).toBe('queued');
   });
 
   it('completes a successful turn and commits session id from sessionStarted', async () => {
@@ -1092,269 +1156,6 @@ describe('TaskEngine workspace cwd', () => {
   });
 });
 
-describe('TaskEngine.sendLiveInput', () => {
-  const LIVE_CAPS: BackendCapabilities = {
-    supportsMCP: true,
-    supportsReasoning: false,
-    supportsDetailedToolEvents: false,
-    supportsLiveInput: true,
-  };
-
-  function snapshotStore(store: TaskStore) {
-    const file = store.getFile();
-    return {
-      revision: file.revision,
-      messageCount: Object.keys(file.messages).length,
-      turnCount: Object.keys(file.turns).length,
-      turnStatuses: Object.fromEntries(
-        Object.entries(file.turns).map(([id, turn]) => [id, turn.status]),
-      ),
-    };
-  }
-
-  async function startGatedTurn(opts: {
-    store: TaskStore;
-    filePath: string;
-    caps?: BackendCapabilities;
-    sendLiveInput?: Backend['sendLiveInput'];
-    holdMs?: number;
-  }): Promise<{
-    engine: TaskEngine;
-    taskId: string;
-    turnId: string;
-    resume: () => void;
-    liveCalls: Array<{ sessionId: string; instruction: string }>;
-  }> {
-    const liveCalls: Array<{ sessionId: string; instruction: string }> = [];
-    let resume!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      resume = resolve;
-    });
-    const caps = opts.caps ?? LIVE_CAPS;
-    const backend: Backend = {
-      name: 'fake',
-      capabilities: caps,
-      async *run() {
-        yield { type: 'sessionStarted', sessionId: 'sess-live-1' };
-        await gate;
-        yield { type: 'turnCompleted' };
-      },
-      sendLiveInput: opts.sendLiveInput
-        ?? (async (request) => {
-          liveCalls.push({
-            sessionId: request.sessionId,
-            instruction: request.instruction,
-          });
-          return { code: 'delivered', sessionId: request.sessionId };
-        }),
-    };
-    const engine = TaskEngine.load({
-      store: opts.store,
-      makeBackend: () => backend,
-      clock: () => '2026-07-06T12:00:00.000Z',
-    });
-    engine.createTask({ id: 'task-live', goal: 'live', backend: 'fake' });
-    const started = engine.startTask('task-live', []);
-    expect(started.ok).toBe(true);
-    if (!started.ok) {
-      throw new Error('startTask failed');
-    }
-    // Wait until the turn is running and session is observed.
-    for (let i = 0; i < 50; i++) {
-      const turn = opts.store.getFile().turns[started.value.turnId];
-      if (turn?.status === 'running' && turn.observedSessionId === 'sess-live-1') {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    return {
-      engine,
-      taskId: 'task-live',
-      turnId: started.value.turnId,
-      resume,
-      liveCalls,
-    };
-  }
-
-  it('delivers to the locally owned active turn without mutating queue/messages', async () => {
-    const { store, filePath } = makeTempStore();
-    const { engine, taskId, resume, liveCalls } = await startGatedTurn({ store, filePath });
-    const before = snapshotStore(store);
-
-    const result = await engine.sendLiveInput(taskId, 'inject now');
-    expect(result).toEqual({ code: 'delivered', sessionId: 'sess-live-1' });
-    expect(liveCalls).toEqual([{ sessionId: 'sess-live-1', instruction: 'inject now' }]);
-    expect(snapshotStore(store)).toEqual(before);
-
-    resume();
-    await engine.whenIdle();
-  });
-
-  it('returns no-active-turn when no turn is running', async () => {
-    const { store } = makeTempStore();
-    const engine = makeEngine(store, [{ type: 'turnCompleted' }]);
-    engine.createTask({ id: 'task-1', goal: 'hello', backend: 'fake' });
-    const before = snapshotStore(store);
-
-    const result = await engine.sendLiveInput('task-1', 'hello');
-    expect(result.code).toBe('no-active-turn');
-    expect(snapshotStore(store)).toEqual(before);
-  });
-
-  it('returns no-active-turn for a settled turn', async () => {
-    const { store, filePath } = makeTempStore();
-    const { engine, taskId, resume } = await startGatedTurn({ store, filePath });
-    resume();
-    await engine.whenIdle();
-    const before = snapshotStore(store);
-
-    const result = await engine.sendLiveInput(taskId, 'too late');
-    expect(result.code).toBe('no-active-turn');
-    expect(snapshotStore(store)).toEqual(before);
-  });
-
-  it('returns not-local-owner when another process holds the lease', async () => {
-    const { store, filePath } = makeTempStore();
-    const { engine, taskId, turnId, resume, liveCalls } = await startGatedTurn({
-      store,
-      filePath,
-    });
-    // Overwrite the local lease with a remote owner PID so ownership checks fail.
-    const { leasePath } = await import('./engine');
-    fs.writeFileSync(
-      leasePath(filePath, turnId),
-      JSON.stringify({
-        pid: process.pid + 10_000,
-        token: 'remote-owner',
-        createdAt: new Date().toISOString(),
-      }),
-      'utf8',
-    );
-    const before = snapshotStore(store);
-
-    const result = await engine.sendLiveInput(taskId, 'steal');
-    expect(result.code).toBe('not-local-owner');
-    expect(liveCalls).toEqual([]);
-    expect(snapshotStore(store)).toEqual(before);
-
-    // Restore local ownership so cleanup can settle.
-    fs.writeFileSync(
-      leasePath(filePath, turnId),
-      JSON.stringify({
-        pid: process.pid,
-        token: 'restored',
-        createdAt: new Date().toISOString(),
-      }),
-      'utf8',
-    );
-    resume();
-    await engine.whenIdle();
-  });
-
-  it('returns unsupported when backend has no live-input path', async () => {
-    const { store, filePath } = makeTempStore();
-    let resume!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      resume = resolve;
-    });
-    const unsupported: Backend = {
-      name: 'fake',
-      capabilities: MCP_CAPS,
-      async *run() {
-        yield { type: 'sessionStarted', sessionId: 'sess-unsup' };
-        await gate;
-        yield { type: 'turnCompleted' };
-      },
-    };
-    const eng = TaskEngine.load({
-      store,
-      makeBackend: () => unsupported,
-      clock: () => '2026-07-06T12:00:00.000Z',
-    });
-    eng.createTask({ id: 'task-u', goal: 'u', backend: 'fake' });
-    const started = eng.startTask('task-u', []);
-    expect(started.ok).toBe(true);
-    if (!started.ok) return;
-    for (let i = 0; i < 50; i++) {
-      const turn = store.getFile().turns[started.value.turnId];
-      if (turn?.status === 'running' && turn.observedSessionId) break;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    const before = snapshotStore(store);
-    const result = await eng.sendLiveInput('task-u', 'nope');
-    expect(result.code).toBe('unsupported');
-    expect(snapshotStore(store)).toEqual(before);
-    resume();
-    await eng.whenIdle();
-    void filePath;
-  });
-
-  it('returns rejected when the backend rejects live input', async () => {
-    const { store, filePath } = makeTempStore();
-    const { engine, taskId, resume } = await startGatedTurn({
-      store,
-      filePath,
-      sendLiveInput: async () => ({ code: 'rejected', reason: 'agent refused' }),
-    });
-    const before = snapshotStore(store);
-    const result = await engine.sendLiveInput(taskId, 'please');
-    expect(result).toEqual({ code: 'rejected', reason: 'agent refused' });
-    expect(snapshotStore(store)).toEqual(before);
-    resume();
-    await engine.whenIdle();
-  });
-
-  it('returns cancelled when the live run aborts during injection', async () => {
-    const { store, filePath } = makeTempStore();
-    let releaseLive!: () => void;
-    const liveHold = new Promise<void>((resolve) => {
-      releaseLive = resolve;
-    });
-    const { engine, taskId, turnId, resume } = await startGatedTurn({
-      store,
-      filePath,
-      sendLiveInput: async (request) => {
-        await liveHold;
-        if (request.signal?.aborted) {
-          return { code: 'cancelled', reason: 'aborted mid-flight' };
-        }
-        return { code: 'delivered', sessionId: request.sessionId };
-      },
-    });
-    const before = snapshotStore(store);
-    const pending = engine.sendLiveInput(taskId, 'race');
-    // Interrupt the live turn while live-input is in flight.
-    engine.interruptTurn(turnId);
-    releaseLive();
-    const result = await pending;
-    expect(result.code).toBe('cancelled');
-    expect(snapshotStore(store).revision).toBeGreaterThanOrEqual(before.revision);
-    // Message/turn counts must not grow from the injection itself.
-    expect(snapshotStore(store).messageCount).toBe(before.messageCount);
-    resume();
-    await engine.whenIdle();
-  });
-
-  it('rejects empty or oversized instructions without queue mutation', async () => {
-    const { store, filePath } = makeTempStore();
-    const { engine, taskId, resume } = await startGatedTurn({ store, filePath });
-    const before = snapshotStore(store);
-
-    await expect(engine.sendLiveInput(taskId, '   ')).resolves.toMatchObject({
-      code: 'rejected',
-    });
-    await expect(engine.sendLiveInput(taskId, 'x'.repeat(20_000))).resolves.toMatchObject({
-      code: 'rejected',
-    });
-    await expect(engine.sendLiveInput('', 'ok')).resolves.toMatchObject({
-      code: 'rejected',
-    });
-    expect(snapshotStore(store)).toEqual(before);
-
-    resume();
-    await engine.whenIdle();
-  });
-});
 
 describe('TaskEngine.editQueuedTurn / deleteQueuedTurn', () => {
   it('edits and deletes undispatched FIFO queued turns without touching live work', async () => {

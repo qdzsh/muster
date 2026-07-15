@@ -137,6 +137,63 @@ function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
     .sort((a, b) => a.sequence - b.sequence);
 }
 
+/**
+ * Clear pending ask_parent on a cancelled task and matching parent inbound.
+ * Required on every cancel path (local graph, deferred processCancelRequests, host cancelTask).
+ */
+export function clearPendingParentQuestionOnCancel(
+  draft: TaskStoreFile,
+  task: MusterTask,
+  now: string,
+): MusterTask {
+  if (!task.pendingParentQuestion) return task;
+  const qId = task.pendingParentQuestion.questionId;
+  const nextTask: MusterTask = {
+    ...task,
+    pendingParentQuestion: undefined,
+    attention:
+      task.attention?.code === 'awaiting_parent_answer' ? undefined : task.attention,
+  };
+  // Clear routed inbound on every task that received this questionId (direct parent
+  // and any open-ancestor deliverParent from ask_parent routing).
+  for (const holder of Object.values(draft.tasks)) {
+    if (!holder.pendingChildQuestions?.[qId]) continue;
+    if (holder.id === task.id) continue;
+    const nextInbound = { ...(holder.pendingChildQuestions ?? {}) };
+    delete nextInbound[qId];
+    const remainingIds = Object.keys(nextInbound).sort();
+    let nextAttention = holder.attention;
+    if (holder.attention?.code === 'child_question') {
+      if (remainingIds.length === 0) {
+        nextAttention = undefined;
+      } else {
+        // Recompute from a deterministic remaining inbound (cancel may have been the surfaced Q).
+        const keepId = remainingIds[0]!;
+        const keep = nextInbound[keepId]!;
+        const keepChild = draft.tasks[keep.fromChildId];
+        const keepSource =
+          keepChild?.pendingParentQuestion?.questionId === keepId
+            ? keepChild.pendingParentQuestion.sourceTurnId
+            : undefined;
+        nextAttention = {
+          code: 'child_question',
+          message: `child ${keep.fromChildId} needs input`,
+          at: now,
+          ...(keepSource ? { sourceTurnId: keepSource } : {}),
+        };
+      }
+    }
+    draft.tasks[holder.id] = {
+      ...holder,
+      pendingChildQuestions: remainingIds.length > 0 ? nextInbound : undefined,
+      attention: nextAttention,
+      revision: holder.revision + 1,
+      updatedAt: now,
+    };
+  }
+  return nextTask;
+}
+
 function childIdsOf(file: TaskStoreFile, parentId: string): string[] {
   return Object.values(file.tasks)
     .filter((t) => t.parentId === parentId)
@@ -207,7 +264,7 @@ export interface GraphEngineDeps {
   /** Independent hard cap on a bridge token's TTL. Defaults to MAX_BRIDGE_TOKEN_TTL_MS. */
   maxBridgeTokenTtlMs?: number;
   clock?: () => string;
-  /** Active in-process runs keyed by turnId. Handles expose abort + live-input context. */
+  /** Active in-process runs keyed by turnId. Handles expose abort controllers. */
   liveRuns: Map<string, { controller: AbortController }>;
   pendingAskPromises: Map<string, { promise: Promise<Answers>; fingerprint: string }>;
   onScheduleTurn: (turnId: string) => void;
@@ -1213,56 +1270,6 @@ export async function executeToolCommand(
       return { ok: true, result: ledger?.result.data };
     }
 
-    case 'start_task': {
-      // Host recovery may still call engine.startTask; coordinator MCP must not
-      // bypass release (capability map also omits start_task for create_child).
-      const commit = deps.store.commit((draft) => {
-        ensureCoordinationMaps(draft);
-        const child = draft.tasks[command.childId];
-        if (!child || child.parentId !== ctx.callerTaskId) {
-          return { ok: false, reason: 'not an owned direct child' };
-        }
-        if ((child.releaseState ?? 'draft') === 'draft') {
-          return { ok: false, reason: 'task not released; use release_tasks' };
-        }
-        const turnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
-        if (draft.turns[turnId]) {
-          const ledger = readLedger(draft, ctx.turnId, command.opId);
-          if (ledger) return { ok: true };
-          return { ok: false, reason: 'turn id collision' };
-        }
-        const turnCheck = canCreateTurn(draft, child.id, limits);
-        if (!turnCheck.ok) return turnCheck;
-        const messageId = randomUUID();
-        draft.messages[messageId] = {
-          id: messageId,
-          taskId: child.id,
-          role: 'user',
-          content: child.goal,
-          state: 'assigned',
-          createdAt: now,
-          turnId,
-        };
-        const started = transitionStartTask(child, turnsForTask(draft, child.id), {
-          turnId,
-          now,
-          inputs: [{ kind: 'message', messageId }],
-          trigger: 'engine',
-        });
-        if (!started.ok) return started;
-        draft.turns[turnId] = started.next;
-        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
-          ok: true,
-          data: { turnId },
-        });
-        return { ok: true };
-      });
-      if (!commit.ok) return { ok: false, error: commit.detail ?? commit.reason };
-      const turnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
-      deps.onScheduleTurn(turnId);
-      return { ok: true, result: { turnId } };
-    }
-
     case 'continue_child': {
       if (deps.isWorkspaceTrusted && !deps.isWorkspaceTrusted()) {
         return {
@@ -1490,37 +1497,11 @@ export async function executeToolCommand(
             sealedBy: coordinatorSeal,
           });
           if (!cancelled.ok) return cancelled;
-          let nextTask = cancelled.next.task;
-          // Clear pending ask_parent on cancelled subtree (ISSUE-8).
-          if (nextTask.pendingParentQuestion) {
-            const qId = nextTask.pendingParentQuestion.questionId;
-            const parentId = nextTask.parentId;
-            nextTask = {
-              ...nextTask,
-              pendingParentQuestion: undefined,
-              attention:
-                nextTask.attention?.code === 'awaiting_parent_answer'
-                  ? undefined
-                  : nextTask.attention,
-            };
-            if (parentId && draft.tasks[parentId]?.pendingChildQuestions?.[qId]) {
-              const p = draft.tasks[parentId]!;
-              const nextInbound = { ...(p.pendingChildQuestions ?? {}) };
-              delete nextInbound[qId];
-              draft.tasks[parentId] = {
-                ...p,
-                pendingChildQuestions:
-                  Object.keys(nextInbound).length > 0 ? nextInbound : undefined,
-                attention:
-                  Object.keys(nextInbound).length === 0 && p.attention?.code === 'child_question'
-                    ? undefined
-                    : p.attention,
-                revision: p.revision + 1,
-                updatedAt: now,
-              };
-            }
-          }
-          draft.tasks[taskId] = nextTask;
+          draft.tasks[taskId] = clearPendingParentQuestionOnCancel(
+            draft,
+            cancelled.next.task,
+            now,
+          );
           if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
           for (const pending of currentPending) {
             if (pending.id === currentLive?.id) continue;
@@ -1627,10 +1608,11 @@ export async function executeToolCommand(
                 sealedBy: coordinatorSeal,
               });
               if (!cancelled.ok) return cancelled;
-              draft.tasks[taskId] = {
-                ...cancelled.next.task,
-                reason: command.reason,
-              };
+              draft.tasks[taskId] = clearPendingParentQuestionOnCancel(
+                draft,
+                { ...cancelled.next.task, reason: command.reason },
+                now,
+              );
               if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
               for (const pending of currentPending) {
                 if (pending.id === currentLive?.id) continue;
@@ -2352,9 +2334,10 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
             const isParentSeal =
               request.sealedBy?.kind === 'coordinator' &&
               request.sealedBy.mode === 'parent_seal';
-            draft.tasks[task.id] = isParentSeal
+            const sealedTask = isParentSeal
               ? { ...cancelled.next.task, reason: request.reason }
               : cancelled.next.task;
+            draft.tasks[task.id] = clearPendingParentQuestionOnCancel(draft, sealedTask, now);
             if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
             for (const pending of pendingTurns) {
               if (pending.id === turn.id) continue;

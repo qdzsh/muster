@@ -37,7 +37,6 @@ const ALL_TOOLS: ToolAction[] = [
   'delegate_tasks',
   'release_tasks',
   'list_task_types',
-  'start_task',
   'interrupt_task',
   'cancel_task',
   'cancel_tasks',
@@ -49,7 +48,6 @@ const ALL_TOOLS: ToolAction[] = [
   'complete_task',
   'fail_task',
   'report_progress',
-  'ask_user',
   'ask_parent',
   'answer_child_question',
   'upsert_presentation',
@@ -262,16 +260,6 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
-  start_task: {
-    type: 'object',
-    required: ['opId', 'childId'],
-    properties: {
-      opId: OP_ID,
-      childId: OP_ID,
-      taskId: OP_ID,
-    },
-    additionalProperties: false,
-  },
   interrupt_task: {
     type: 'object',
     required: ['opId', 'childId'],
@@ -372,15 +360,6 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     properties: {
       opId: OP_ID,
       note: { type: 'string', minLength: 1 },
-    },
-    additionalProperties: false,
-  },
-  ask_user: {
-    type: 'object',
-    required: ['opId', 'questions'],
-    properties: {
-      opId: OP_ID,
-      questions: { type: 'array', items: QUESTION_SCHEMA, minItems: 1 },
     },
     additionalProperties: false,
   },

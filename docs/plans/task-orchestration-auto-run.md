@@ -1,8 +1,7 @@
 # Plan: Task orchestration auto-run (brief, release, dataflow)
 
 ## Status
-**APPROVED** — codex-plan-review 2026-07-14-002 (2 rounds; ISSUE-12…17 fixed).  
-Session: `.codex-review/sessions/codex-plan-review-20260714-002`.
+**PARTIAL** (2026-07-15) — W1–W9 + cleanup C3 (MCP catalog no `start_task`/`ask_user`; host `startTask` retained). Final IMPLEMENTED after cleanup release gate.
 
 Prior APPROVED plan was lost (never committed). This document is a full rewrite incorporating:
 

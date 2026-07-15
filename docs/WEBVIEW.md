@@ -10,7 +10,7 @@ Authoritative spec for the Muster chat sidebar webview: tech stack, folder layou
 
 **Related docs (do not duplicate here):**
 - [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md) — `NormalizedEvent` types and adapter invariants
-- [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — `ask_user` + AskBridge (§3.2–3.3), extension↔webview messages (§6)
+- [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — elicitation / AskBridge (§3.2–3.3), extension↔webview messages (§6)
 - [`SESSION-MANAGEMENT.md`](SESSION-MANAGEMENT.md) — resume IDs, `.muster-sessions.json`
 - [`DESIGN.md`](DESIGN.md) — coordinator architecture (extension host vs webview)
 - [`SETTINGS.md`](SETTINGS.md) — host-backed Settings pattern for feature configuration
@@ -191,7 +191,7 @@ Webview never calls MCP or spawns CLIs. All I/O goes through the extension host.
 | `historyChunk` | `{ items: TranscriptItem[]; hasMore: boolean }` | Reply to `loadHistory`: older items to **prepend** (scroll-up), or the latest window on restore |
 | `sessionReset` | `{}` | New session — clear thread state |
 
-`Question` shape (from `muster_bridge` `ask_user`):
+`Question` shape (from ACP elicitation / AskBridge / `ask_parent`):
 
 ```ts
 interface Question {
@@ -292,8 +292,8 @@ Source of truth for event shapes: [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md). UI rules
 | Prompt input | `vscode-textarea` |
 | Backend picker | `vscode-single-select` |
 | Tool output / reasoning | `vscode-collapsible` |
-| ask_user options | `vscode-radio` or `vscode-checkbox` |
-| ask_user free text | `vscode-textfield` |
+| elicitation / ask options | `vscode-radio` or `vscode-checkbox` |
+| elicitation / ask free text | `vscode-textfield` |
 | Group labels | `vscode-form-group` |
 | MCP / running badge | `vscode-badge` |
 | Divider | `vscode-divider` |

@@ -1,7 +1,7 @@
 # Plan: Task + Chat + Turn only — hide CLI from user UX
 
 ## Status
-**APPROVED** — codex-plan-review 2026-07-13 (3 rounds). Ready for implementation.
+**PARTIAL** (2026-07-15) — A/B/C + cleanup C2 (`cli-status` deleted; host-authoritative TurnActivity; missing key = neutral). Final IMPLEMENTED after cleanup release gate.
 
 ## Target UX (user mental model)
 User **only** knows:

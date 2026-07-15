@@ -27,7 +27,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 | Webview task UI (list + workspace, protocol v2) | ✅ |
 | Muster Bridge + coordinator tools | ✅ |
 | MCP via `mcpServers` (context + Bridge) | ✅ |
-| MCP `ask_user` (Muster Bridge) | ✅ — [design](docs/MUSTER-BRIDGE.md) |
+| ACP RFD elicitation + Grok ask adapter | ✅ — MCP `ask_user` removed; see [MUSTER-BRIDGE.md](docs/MUSTER-BRIDGE.md) |
 | Reload recovery UI (Retry / Continue / Resume) | ✅ |
 | Read-only presentation tabs | ✅ — [review and revision guide](docs/WEBVIEW.md) |
 
@@ -87,7 +87,7 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/DESIGN.md](docs/DESIGN.md) | Architecture overview |
 | [docs/ADAPTER-SPEC.md](docs/ADAPTER-SPEC.md) | Backend adapter contract |
 | [docs/CLI-COMMANDS.md](docs/CLI-COMMANDS.md) | Per-CLI flags & streaming |
-| [docs/MUSTER-BRIDGE.md](docs/MUSTER-BRIDGE.md) | MCP `ask_user` + AskBridge |
+| [docs/MUSTER-BRIDGE.md](docs/MUSTER-BRIDGE.md) | Bridge / AskBridge (Grok vendor); MCP ask_user removed |
 | [docs/MCP-INJECTION.md](docs/MCP-INJECTION.md) | MCP config per backend |
 | [docs/SESSION-MANAGEMENT.md](docs/SESSION-MANAGEMENT.md) | Session IDs & resume |
 | [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model, TaskEngine, and Markdown export contract |

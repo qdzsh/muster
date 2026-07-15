@@ -9,7 +9,7 @@ export interface CommandErrorState {
   message: string;
 }
 
-/** Non-error status notice (e.g. live-input delivered acknowledgement). */
+/** Non-error status notice (e.g. export saved). */
 export interface CommandNoticeState {
   taskId: string | null;
   message: string;
@@ -70,7 +70,7 @@ class TasksState {
     model?: string;
   } | null>(null);
 
-  /** Transient success/status notice (live-input delivered, etc.). */
+  /** Transient success/status notice (export, general command feedback). */
   commandNotice = $state<CommandNoticeState | null>(null);
 
   /**

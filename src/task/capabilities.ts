@@ -7,7 +7,6 @@ export type CoordinatorAction =
   | 'delegate_tasks'
   | 'release_tasks'
   | 'list_task_types'
-  | 'start_task'
   | 'interrupt_task'
   | 'cancel_task'
   | 'cancel_tasks'
@@ -22,7 +21,6 @@ export type AnyTaskAction =
   | 'complete_task'
   | 'fail_task'
   | 'report_progress'
-  | 'ask_user'
   | 'ask_parent'
   | 'get_host_context';
 
@@ -66,10 +64,8 @@ export function capabilitiesFor(
   task: Pick<MusterTask, 'role' | 'capabilities' | 'parentId'>,
 ): Set<ToolAction> {
   const granted = new Set<ToolAction>(ANY_TASK_ACTIONS);
-  // Root may ask the user; non-root uses ask_parent by default.
-  if (task.parentId === null || task.parentId === undefined) {
-    granted.add('ask_user');
-  } else {
+  // Non-root uses ask_parent; root uses ACP elicitation (not MCP ask_user).
+  if (task.parentId !== null && task.parentId !== undefined) {
     granted.add('ask_parent');
   }
   if (task.role === 'coordinator') {

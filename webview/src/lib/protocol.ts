@@ -188,8 +188,6 @@ export interface QueuedTurnProjection {
   createdAt: string;
   /** Host-projected user text so the queue panel works without chat bubbles. */
   previewText?: string;
-  /** Prefer concurrent inject when a live turn is available. */
-  delivery?: 'turn' | 'live_inject';
 }
 
 export interface SnapshotMessage {
@@ -374,12 +372,6 @@ export type ExtMessage =
       reason: string;
       code?: 'conflict' | 'capacity' | 'store' | 'validation' | 'unknown';
     }
-  /**
-   * Host acknowledgement that a live-input instruction was delivered to the
-   * locally owned active backend session. Refusals use `commandError` with a
-   * capability- or ownership-specific message instead — never a queued turn.
-   */
-  | { type: 'liveInputResult'; taskId: string; code: 'delivered'; sessionId: string }
   /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
   | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
@@ -490,10 +482,10 @@ export type OutMessage =
     }
   | { type: 'continueTask'; taskId: string; instruction: string }
   /**
-   * Deliver an instruction to the currently running, locally owned turn for
-   * `taskId` when the backend proves live-input support. Distinct from
-   * `continueTask` (which queues a follow-up turn). Host refuses with
-   * `commandError` when unsupported / not local owner / no active turn.
+   * Interrupt & send: reserve a FIFO follow-up turn and interrupt the local
+   * active turn for `taskId` (wire name retained; concurrent inject removed).
+   * Host maps this only to `TaskEngine.interruptAndSend`. Refusals use
+   * `commandError` (not local owner / no active turn / validation).
    */
   | { type: 'sendLiveInput'; taskId: string; instruction: string }
   /**
@@ -889,8 +881,7 @@ function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
     Array.isArray(v.messageIds) &&
     v.messageIds.every(isString) &&
     isString(v.createdAt) &&
-    (v.previewText === undefined || isString(v.previewText)) &&
-    (v.delivery === undefined || v.delivery === 'turn' || v.delivery === 'live_inject')
+    (v.previewText === undefined || isString(v.previewText))
   );
 }
 
@@ -1083,13 +1074,6 @@ export function isExtMessage(data: unknown): data is ExtMessage {
           data.code === 'unknown')
       );
 
-    case 'liveInputResult':
-      return (
-        hasOnlyKeys(data, ['type', 'taskId', 'code', 'sessionId']) &&
-        isString(data.taskId) &&
-        data.code === 'delivered' &&
-        isString(data.sessionId)
-      );
 
     case 'filePicked':
       return isString(data.path) && (data.displayName === undefined || isString(data.displayName));
@@ -1204,17 +1188,6 @@ function isFileMentionSuggestionsMessage(data: Record<string, unknown>): boolean
 }
 
 /**
- * User-visible acknowledgement for a successful host `liveInputResult`.
- * Session id is required so callers never invent a silent/empty success banner.
- */
-export function formatLiveInputDeliveredMessage(sessionId: string): string {
-  if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
-    throw new Error('sessionId is required for live-input delivered acknowledgements');
-  }
-  return 'Live input delivered to the active session.';
-}
-
-/**
  * User-visible acknowledgement for a successful host `exportResult`.
  * `fileName` must be a basename only (no path separators or drive prefixes) so
  * the notice never surfaces absolute destinations. `sourceRevision` is the
@@ -1236,9 +1209,9 @@ export function formatExportResultMessage(fileName: string, sourceRevision: numb
 }
 
 /**
- * Task-scoped banner visibility shared by commandError refusals and live-input
- * success notices. Global (absent/null taskId) banners always show; otherwise
- * only the currently focused task sees the feedback.
+ * Task-scoped banner visibility for commandError refusals and command notices.
+ * Global (absent/null taskId) banners always show; otherwise only the currently
+ * focused task sees the feedback.
  */
 export function isTaskScopedBannerVisible(
   taskId: string | null | undefined,

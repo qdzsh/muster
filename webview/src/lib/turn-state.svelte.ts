@@ -6,7 +6,7 @@ export interface UserItem {
   id: string;
   text: string;
   turnId?: string;
-  /** Mid-turn live_inject order (interleaved with assistant/tool segments). */
+  /** Optional mid-turn order (interleaved with assistant/tool segments). */
   order?: number;
 }
 export interface AssistantItem {

@@ -4,7 +4,7 @@ import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
-import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../types';
+import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { assembleFirstTurnPrompt, synthesizeBriefFromGoal } from './brief';
@@ -40,6 +40,7 @@ import type { DepGraph } from './deps';
 import {
   buildRunOptionsForTurn,
   cleanupTurnResources,
+  clearPendingParentQuestionOnCancel,
   executeToolCommand,
   processCancelRequests,
   pruneLedgerForTurn,
@@ -528,16 +529,14 @@ export class TaskEngine {
     cwd?: string,
   ) => import('./task-types').TaskTypeRegistryResult;
   /**
-   * In-process handles for currently executing turns. Keyed by turnId so live
-   * input can route only to a run this engine owns, with the exact backend
-   * instance and abort signal for that turn.
+   * In-process handles for currently executing turns. Keyed by turnId so this
+   * engine can abort only runs it owns and map session ids back to turns.
    */
   private readonly liveRuns = new Map<
     string,
     {
       controller: AbortController;
       taskId: string;
-      backend: Backend;
       sessionId?: string;
       /**
        * Monotonic render-order allocator for this live turn (assistant/tool segments).
@@ -2362,100 +2361,6 @@ export class TaskEngine {
     return { ok: true, value: undefined };
   }
 
-  /**
-   * Hard upper bound for live-input instruction size. Host boundary may apply
-   * a tighter limit; this protects the engine/backend path.
-   */
-  static readonly MAX_LIVE_INPUT_CHARS = 8_192;
-
-  /**
-   * Deliver an instruction to the task's currently running, locally owned turn.
-   * Never persists a TaskMessage or TaskTurn — refusals and deliveries alike
-   * leave queue/message/revision state unchanged.
-   */
-  async sendLiveInput(taskId: string, instruction: string): Promise<LiveInputResult> {
-    const trimmedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
-    if (!trimmedTaskId) {
-      return { code: 'rejected', reason: 'task id is required for live input' };
-    }
-    if (typeof instruction !== 'string' || !instruction.trim()) {
-      return { code: 'rejected', reason: 'instruction is required for live input' };
-    }
-    if (instruction.length > TaskEngine.MAX_LIVE_INPUT_CHARS) {
-      return {
-        code: 'rejected',
-        reason: `instruction exceeds ${TaskEngine.MAX_LIVE_INPUT_CHARS} characters`,
-      };
-    }
-
-    const file = this.store.getFile();
-    const task = file.tasks[trimmedTaskId];
-    if (!task) {
-      return { code: 'rejected', reason: 'task not found' };
-    }
-
-    const liveTurn = turnsForTask(file, trimmedTaskId).find((t) => t.status === 'running');
-    if (!liveTurn) {
-      return { code: 'no-active-turn', reason: 'no running turn for task' };
-    }
-
-    // Local ownership: this process must hold the turn lease.
-    if (!ownsLocalLease(this.storePath, liveTurn.id)) {
-      return {
-        code: 'not-local-owner',
-        reason: 'running turn is not owned by this process',
-      };
-    }
-
-    const handle = this.liveRuns.get(liveTurn.id);
-    if (!handle || handle.taskId !== trimmedTaskId) {
-      // Lease says local but no in-process handle (stale/settling race).
-      return { code: 'no-active-turn', reason: 'no in-process live run for task' };
-    }
-    if (handle.controller.signal.aborted) {
-      return { code: 'cancelled', reason: 'live run is cancelling' };
-    }
-
-    const sessionId =
-      handle.sessionId ??
-      liveTurn.observedSessionId ??
-      task.committedSessionId;
-    if (!sessionId) {
-      return {
-        code: 'no-active-turn',
-        reason: 'active turn has no session identity yet',
-      };
-    }
-
-    const backend = handle.backend;
-    const caps = backend.capabilities;
-    if (!caps?.supportsLiveInput || typeof backend.sendLiveInput !== 'function') {
-      return {
-        code: 'unsupported',
-        reason: `backend ${backend.name} does not support live input`,
-      };
-    }
-
-    // Re-check cancellation immediately before dispatch.
-    if (handle.controller.signal.aborted) {
-      return { code: 'cancelled', reason: 'live run is cancelling' };
-    }
-
-    try {
-      const result = await backend.sendLiveInput({
-        sessionId,
-        instruction,
-        signal: handle.controller.signal,
-      });
-      return result;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (handle.controller.signal.aborted || /abort|cancel/i.test(message)) {
-        return { code: 'cancelled', reason: message };
-      }
-      return { code: 'rejected', reason: message };
-    }
-  }
 
   interruptTurn(turnId: string): EngineResult<void> {
     const handle = this.liveRuns.get(turnId);
@@ -2743,6 +2648,8 @@ export class TaskEngine {
             opId: `cancel-task-${taskId}`,
             at: now,
           };
+          // Clear pending ask_parent now; remote processCancelRequests also cleans.
+          draft.tasks[id] = clearPendingParentQuestionOnCancel(draft, task, now);
           continue;
         }
         const result = transitionCancelTask(task, {
@@ -2753,7 +2660,7 @@ export class TaskEngine {
         if (!result.ok) {
           return result;
         }
-        draft.tasks[id] = result.next.task;
+        draft.tasks[id] = clearPendingParentQuestionOnCancel(draft, result.next.task, now);
         if (result.next.turn) {
           draft.turns[result.next.turn.id] = result.next.turn;
         }
@@ -3346,6 +3253,9 @@ export class TaskEngine {
       pruneLedgerForTurn(draft, turnId);
       return { ok: true };
     });
+    // Apply dependency terminals before child waits so block-policy sinks get
+    // attention and parents wake without waiting for an unrelated rescan.
+    this.applyDependencyTerminals();
     this.reconcileChildWaits();
     this.drainPendingSendsAfterSettlement(turnId);
   }
@@ -3510,6 +3420,9 @@ export class TaskEngine {
             a.createdAt.localeCompare(b.createdAt) ||
             a.id.localeCompare(b.id),
         );
+      // Always re-apply dependency terminals after settlement so blocked sinks
+      // get attention even when tryPromoteTurn fails and scheduleTurn never runs.
+      this.applyDependencyTerminals();
       for (const turn of queued) {
         if (this.deferredQueuedTurns.has(turn.id)) {
           continue;
@@ -3761,8 +3674,7 @@ export class TaskEngine {
     }
 
     const abort = new AbortController();
-    // Placeholder backend until factory succeeds; live input refuses unsupported
-    // until the real instance is installed below.
+    // Placeholder backend until factory succeeds.
     let backend: Backend = {
       name: task.backend,
       run: async function* () {},
@@ -3770,7 +3682,6 @@ export class TaskEngine {
     this.liveRuns.set(turnId, {
       controller: abort,
       taskId: turn.taskId,
-      backend,
       sessionId: undefined,
     });
     const turnTimeoutMs = task.executionPolicy.turnTimeoutMs;
@@ -3790,7 +3701,7 @@ export class TaskEngine {
     let terminalSettled = false;
     // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
     // `order` is a per-turn monotonic counter shared by assistant segments, tools,
-    // and mid-turn live_inject user messages; `(turn.sequence, order)` reconstructs
+    // and mid-turn user messages; `(turn.sequence, order)` reconstructs
     // the exact live interleaving.
     let orderCounter = 0;
     const nextOrder = (): number => orderCounter++;
@@ -3804,8 +3715,6 @@ export class TaskEngine {
     try {
       try {
         backend = this.makeBackend(task.backend);
-        const liveHandle = this.liveRuns.get(turnId);
-        if (liveHandle) liveHandle.backend = backend;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         terminalSettled = await this.settleFailed(

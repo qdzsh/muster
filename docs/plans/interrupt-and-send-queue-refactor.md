@@ -1,7 +1,9 @@
 # Plan: Queue + Direct Message = Interrupt & Send
 
 ## Status
-**APPROVED** — codex-plan-review 2026-07-13 (3 rounds). Ready for implementation.
+**PARTIAL** (2026-07-15) — product path + concurrent inject stack deleted (cleanup C1).  
+Evidence: `TaskEngine.interruptAndSend`; host `sendLiveInput` → reserve+interrupt only; no `liveInputResult` / `Backend.sendLiveInput` / `supportsLiveInput`.  
+Final IMPLEMENTED after cleanup release gate (Node 24).
 
 ## Target
 Refactor Muster’s mid-turn user messaging so **direct messages are interrupt & send (cut & continue)** by default, not concurrent ACP `session/prompt` “live inject”.

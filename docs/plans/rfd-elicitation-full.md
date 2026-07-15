@@ -1,5 +1,8 @@
 # Plan: Full ACP RFD Elicitation Support
 
+## Status
+**PARTIAL** (2026-07-15) — form+url caps, `ElicitationBridge`, Form/Url cards, `-32042`, complete; MCP ask_user removed (cleanup C3). C4 AC checklist audit pending.
+
 ## Goal
 
 Implement the full [ACP RFD Elicitation](https://agentclientprotocol.com/rfds/elicitation.md) surface in Muster so agents can request structured user input via `elicitation/create`, with correct capability negotiation, form + URL modes, three-action responses, URL completion, and `-32042` URL-required error handling. Vendor-specific ask paths (Grok `x.ai/ask_user_question`) remain adapters into the same UI layer.

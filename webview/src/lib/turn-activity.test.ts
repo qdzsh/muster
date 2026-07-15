@@ -73,14 +73,44 @@ describe('deriveTurnActivityState', () => {
 });
 
 describe('turnActivityFromTask', () => {
-  it('uses client derive only when currentTurnActivity key is absent (pre-host)', () => {
+  it('does not invent recovery chrome when currentTurnActivity key is absent', () => {
+    expect(
+      turnActivityFromTask({
+        lifecycle: 'open',
+        runtimeActivity: 'needs_recovery',
+        viewStatus: 'needs_recovery',
+      } as Parameters<typeof turnActivityFromTask>[0]),
+    ).toBe('null');
     expect(
       turnActivityFromTask({
         lifecycle: 'open',
         runtimeActivity: 'running',
         viewStatus: 'running',
       } as Parameters<typeof turnActivityFromTask>[0]),
+    ).toBe('null');
+  });
+
+  it('allows threadRunning / askPending only when host activity key is absent', () => {
+    expect(
+      turnActivityFromTask(
+        {
+          lifecycle: 'open',
+          runtimeActivity: 'idle',
+          viewStatus: 'idle',
+        } as Parameters<typeof turnActivityFromTask>[0],
+        { threadRunning: true },
+      ),
     ).toBe('executing');
+    expect(
+      turnActivityFromTask(
+        {
+          lifecycle: 'open',
+          runtimeActivity: 'idle',
+          viewStatus: 'idle',
+        } as Parameters<typeof turnActivityFromTask>[0],
+        { askPending: true },
+      ),
+    ).toBe('waiting_you');
   });
 
   it('prefers host currentTurnActivity when present', () => {

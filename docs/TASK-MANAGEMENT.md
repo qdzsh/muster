@@ -8,7 +8,7 @@ domain concepts and invariants that implementation types must preserve.
 - [`DESIGN.md`](DESIGN.md) — extension architecture and per-turn process model
 - [`SESSION-MANAGEMENT.md`](SESSION-MANAGEMENT.md) — backend-specific session identity and resume rules
 - [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md) — `NormalizedEvent`, `RunOptions`, and adapter turn lifecycle
-- [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — MCP transport and `ask_user`
+- [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — MCP transport; human ask via ACP elicitation / `ask_parent` (MCP `ask_user` removed)
 - [`WEBVIEW.md`](WEBVIEW.md) — chat rendering and `postMessage` protocol
 
 **Status:** Design contract for the task-management implementation. If another
@@ -280,7 +280,7 @@ Default graph capabilities are:
 | Role | Graph capabilities |
 |------|--------------------|
 | Root/sub-coordinator | Host-approved subset of all `TaskCapability` values |
-| Worker | None; self-disposition and `ask_user` do not extend the graph |
+| Worker | None; self-disposition and `ask_parent` do not extend the graph |
 
 #### 4.1.1 Outcome authority (who may seal lifecycle)
 
@@ -458,7 +458,7 @@ Working / Waiting for you / Queued / Could not finish / (no strip when ready).
 // Product-facing (Phase A client-derived; Phase B host-owned currentTurnActivity)
 type TurnActivityState =
   | 'executing'    // live turn generating
-  | 'waiting_you'  // ask_user / waiting_user
+  | 'waiting_you'  // elicitation / waiting_user
   | 'queued'       // turn queued, not yet live
   | 'failed_turn'  // needs_recovery / last turn failed
   | 'null';         // ready / between turns — no strip
@@ -488,7 +488,7 @@ type TaskRuntimeActivity =
   | 'idle'
   | 'queued'
   | 'running'              // live turn generating → product turn activity = executing
-  | 'waiting_user'         // live ask_user → product turn activity = waiting_you
+  | 'waiting_user'         // live elicitation / ask_parent → product turn activity = waiting_you
   | 'waiting_dependencies'
   | 'waiting_children'
   | 'blocked'
@@ -733,7 +733,7 @@ For child wait barriers and dependencies:
 
 ```text
 queued ──scheduler starts process──► running
-running ──ask_user registered──────► waiting_user
+running ──elicitation / ask_parent registered──────► waiting_user
 waiting_user ──answer submitted────► running
 running ──adapter turnCompleted────► succeeded
 running ──adapter error────────────► failed
@@ -811,8 +811,9 @@ blockers.
 ## 8. Coordinator protocol
 
 Coordinator turns receive host-scoped task-management MCP tools. Workers receive
-`ask_user`, progress tools, and self-disposition tools, but not graph-extension
-tools.
+progress tools and self-disposition tools, but not graph-extension tools.
+Human-in-the-loop: root tasks use **ACP RFD elicitation**; non-root children use
+**`ask_parent`** (MCP `ask_user` is removed).
 
 ### 8.1 Tool surface
 
@@ -823,7 +824,6 @@ tools.
 | `list_task_types` | Coordinator (`create_child`) | Live registry summary (id, backend, model?, role, briefKind) + diagnostics. **No `opId`**, no ledger. Prefer types already in first-turn host context; call to refresh only |
 | `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents. Optional **`waitForTaskIds`** exact wait subset (requires `wait_child`). Uses **persisted** backend/model — never re-resolves registry |
 | `delegate_tasks` | Coordinator | Batch create+release (up to 16). Optional **`waitForLocalIds`** exact wait subset. Intra-batch `dependsOn` / bindings → `succeeded`/`fail` deps |
-| `start_task` | **Host / recovery only** | Not in coordinator MCP `allowedActions`; rejects draft |
 | `interrupt_task` | Coordinator | Interrupt an active direct child turn (`interrupt_child` cap) |
 | `cancel_task` | Coordinator | Cancel direct child + cascade unfinished descendants (`cancel_child` cap); `sealedBy.coordinator` |
 | `set_task_lifecycle` | Coordinator | **Parent-seal** a direct child's lifecycle (`succeeded`/`failed`/`cancelled`/`skipped`) when the child omitted disposition (`cancel_child` cap). See §5.3 |
@@ -833,7 +833,8 @@ tools.
 | `complete_task` | Any task | Stage successful completion; **seal or propose** per outcome mode + role (§4.1.1) |
 | `fail_task` | Any task | Stage failure; seal or propose per mode + role |
 | `report_progress` | Any task | Update optional progress metadata |
-| `ask_user` | Any task | Block the caller's live turn for structured user input |
+| `ask_parent` | Non-root task | Block child turn; route structured questions to parent (`answer_child_question`) |
+| `answer_child_question` | Parent coordinator | Answer a pending child `ask_parent` and queue child continuation |
 
 **Task types (v1):** Config SoT is resource-scoped VS Code setting `muster.taskTypes` (id → `{ backend, model?, role?, briefKind?, description? }`). Empty registry → create/delegate fail with `task_types_not_configured` (zero mutations). Malformed → `invalid_task_type_config`. Unknown type → `unknown_task_type` even if `backend` override is present. Typo backend id → `backend_unsupported`. No built-in product default types.
 
@@ -1030,7 +1031,7 @@ Immediately before a queued turn becomes `running`, the engine atomically assign
 eligible pending messages, writes their IDs into `TurnInput`, and persists both
 records. Messages arriving after process spawn remain pending for a later turn.
 
-Opening a child lets the user inspect its stream, answer that child's `ask_user`,
+Opening a child lets the user inspect its stream, answer that child's `ask_parent`
 or send a follow-up while it remains open. A direct parent observes only persisted
 child outcome/result updates, not private session history.
 
@@ -1291,7 +1292,7 @@ the webview status menu uses `setTaskLifecycle` only.
 
 - [ ] Root task list and first-message task creation
 - [ ] Focused task navigation and `taskId` + `turnId` protocol
-- [ ] Durable messages/pending-input delivery and child `ask_user` interaction
+- [ ] Durable messages/pending-input delivery and child `ask_parent` interaction
 - [ ] Continuation task UX
 
 ### Phase E — Migration and cleanup

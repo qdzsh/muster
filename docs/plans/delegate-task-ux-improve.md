@@ -1,6 +1,6 @@
 # Plan: Coordinator delegate / child-task UX improve
 
-**Status:** APPROVED (codex-plan-review, 4 rounds)  
+**Status:** PARTIAL (2026-07-15) — P0–P2 on `main`; C5 cancel/dep residuals under cleanup-legacy-debt.  
 **Goal:** Coordinator spawns and finishes children in few tool steps; engine owns most child lifecycle; user only talks goals with the coordinator.
 
 **Sessions:**

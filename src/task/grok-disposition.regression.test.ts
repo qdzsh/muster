@@ -19,7 +19,6 @@ describe('§9 gate regression — backend MCP eligibility', () => {
         supportsMCP: false,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false
       }),
     ).toBe(false);
   });

@@ -4,7 +4,12 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
-import { deriveEntityId, issueTurnCredential, type GraphEngineDeps } from './engine-graph';
+import {
+  clearPendingParentQuestionOnCancel,
+  deriveEntityId,
+  issueTurnCredential,
+  type GraphEngineDeps,
+} from './engine-graph';
 import { TaskEngine } from './engine';
 import {
   DEFAULT_EXECUTION_POLICY_BOUNDS,
@@ -28,7 +33,6 @@ const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false
 };
 
 function makeHarness() {
@@ -73,6 +77,108 @@ describe('engine graph orchestration', () => {
     expect(a).not.toBe(c);
   });
 
+  it('C5: cancel one of multiple child questions recomputes parent attention', () => {
+    const draft = {
+      tasks: {
+        parent: {
+          id: 'parent',
+          role: 'coordinator' as const,
+          lifecycle: 'open' as const,
+          goal: 'p',
+          parentId: null,
+          dependencies: [],
+          backend: 'grok',
+          capabilities: [],
+          executionPolicy: {
+            maxTurns: 10,
+            maxAutomaticRetries: 0,
+            turnTimeoutMs: 60_000,
+            taskTimeoutMs: 120_000,
+          },
+          revision: 1,
+          createdAt: 't0',
+          updatedAt: 't0',
+          attention: {
+            code: 'child_question' as const,
+            message: 'child c2 needs input',
+            at: 't2',
+            sourceTurnId: 'turn2',
+          },
+          pendingChildQuestions: {
+            q1: { fromChildId: 'c1', questions: [{ prompt: 'q1' }], askedAt: 't1' },
+            q2: { fromChildId: 'c2', questions: [{ prompt: 'q2' }], askedAt: 't2' },
+          },
+        },
+        c1: {
+          id: 'c1',
+          role: 'worker' as const,
+          lifecycle: 'open' as const,
+          goal: 'c1',
+          parentId: 'parent',
+          dependencies: [],
+          backend: 'grok',
+          capabilities: [],
+          executionPolicy: {
+            maxTurns: 10,
+            maxAutomaticRetries: 0,
+            turnTimeoutMs: 60_000,
+            taskTimeoutMs: 120_000,
+          },
+          revision: 1,
+          createdAt: 't0',
+          updatedAt: 't0',
+          pendingParentQuestion: {
+            questionId: 'q1',
+            questions: [{ prompt: 'q1' }],
+            askedAt: 't1',
+            sourceTurnId: 'turn1',
+          },
+        },
+        c2: {
+          id: 'c2',
+          role: 'worker' as const,
+          lifecycle: 'open' as const,
+          goal: 'c2',
+          parentId: 'parent',
+          dependencies: [],
+          backend: 'grok',
+          capabilities: [],
+          executionPolicy: {
+            maxTurns: 10,
+            maxAutomaticRetries: 0,
+            turnTimeoutMs: 60_000,
+            taskTimeoutMs: 120_000,
+          },
+          revision: 1,
+          createdAt: 't0',
+          updatedAt: 't0',
+          attention: {
+            code: 'awaiting_parent_answer' as const,
+            message: 'wait',
+            at: 't2',
+            sourceTurnId: 'turn2',
+          },
+          pendingParentQuestion: {
+            questionId: 'q2',
+            questions: [{ prompt: 'q2' }],
+            askedAt: 't2',
+            sourceTurnId: 'turn2',
+          },
+        },
+      },
+      turns: {},
+      messages: {},
+    };
+    const nextChild = clearPendingParentQuestionOnCancel(draft as never, draft.tasks.c2 as never, 'now');
+    expect(nextChild.pendingParentQuestion).toBeUndefined();
+    const parent = draft.tasks.parent;
+    expect(parent.pendingChildQuestions?.q2).toBeUndefined();
+    expect(parent.pendingChildQuestions?.q1).toBeTruthy();
+    expect(parent.attention?.code).toBe('child_question');
+    expect(parent.attention?.message).toBe('child c1 needs input');
+    expect(parent.attention?.sourceTurnId).toBe('turn1');
+  });
+
   it('rejects worker create_task via tool handler', async () => {
     const { store, engine, credentials } = makeHarness();
     engine.createTask({ id: 'root', goal: 'coord', backend: 'grok', role: 'coordinator' });
@@ -83,7 +189,7 @@ describe('engine graph orchestration', () => {
       rootId: 'root',
       callerTaskId: 'root',
       turnId: started.value!.turnId,
-      allowedActions: new Set(['complete_task', 'ask_user']),
+      allowedActions: new Set(['complete_task', 'complete_task']),
       ttlMs: 60_000,
     });
     const ctx = credentials.verify(token)!;
@@ -117,7 +223,7 @@ describe('engine graph orchestration', () => {
         'wait_for_tasks',
         'get_task_status',
         'complete_task',
-        'ask_user',
+        'complete_task',
       ]),
       ttlMs: 60_000,
     });
@@ -157,7 +263,7 @@ describe('engine graph orchestration', () => {
         'create_task',
         'delegate_task',
         'release_tasks',
-        'start_task',
+        'get_task_status',
         'wait_for_tasks',
         'complete_task',
       ]),
@@ -179,17 +285,6 @@ describe('engine graph orchestration', () => {
     const childB = deriveEntityId(turnId, 'op-b', 'task');
     expect(store.getTask(childA)?.releaseState).toBe('draft');
     expect(store.getTask(childB)?.releaseState).toBe('draft');
-
-    // start_task on draft must fail even if credential still lists it.
-    const startDraft = await engine.handleToolCall(ctx, 'start_task', {
-      kind: 'start_task',
-      opId: 'op-start-draft',
-      childId: childA,
-    });
-    expect(startDraft.ok).toBe(false);
-    if (!startDraft.ok) {
-      expect(startDraft.error).toMatch(/not released/);
-    }
 
     // Atomic fail: include a missing id → neither child releases.
     const badRelease = await engine.handleToolCall(ctx, 'release_tasks', {
@@ -1364,7 +1459,7 @@ describe('engine graph batch create/delegate', () => {
       callerTaskId: 'root',
       turnId: started.value.turnId,
       // Worker credential never carries the batch action.
-      allowedActions: new Set(['complete_task', 'ask_user']),
+      allowedActions: new Set(['complete_task', 'complete_task']),
       ttlMs: 60_000,
     });
     const ctx = credentials.verify(token)!;
@@ -1759,6 +1854,252 @@ describe('engine graph batch create/delegate', () => {
     expect(cancelled.ok).toBe(true);
     expect(store.getTask(aId)?.lifecycle).toBe('cancelled');
     expect(store.getTask(bId)?.lifecycle).toBe('cancelled');
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P1: cancel_tasks clears pending ask_parent and parent inbound attention', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'cancel_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set([
+        'delegate_task',
+        'wait_for_tasks',
+        'cancel_tasks',
+        'cancel_task',
+      ]),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const delegated = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-ask-can',
+      waitForCompletion: true,
+      spec: { goal: 'work', taskType: 'worker' },
+    });
+    expect(delegated.ok).toBe(true);
+    const childId = deriveEntityId(turnId, 'op-ask-can', 'task');
+    let childTurn = Object.values(store.getFile().turns).find(
+      (t) => t.taskId === childId && t.sequence === 1,
+    );
+    for (let i = 0; i < 50 && !childTurn; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      childTurn = Object.values(store.getFile().turns).find(
+        (t) => t.taskId === childId && t.sequence === 1,
+      );
+    }
+    expect(childTurn).toBeTruthy();
+    for (let i = 0; i < 50 && store.getFile().turns[childTurn!.id]?.status !== 'running'; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const childToken = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: childId,
+      turnId: childTurn!.id,
+      allowedActions: new Set(['ask_parent']),
+      ttlMs: 60_000,
+    });
+    const childCtx = credentials.verify(childToken)!;
+    const asked = await engine.handleToolCall(childCtx, 'ask_parent', {
+      kind: 'ask_parent',
+      opId: 'op-q-can',
+      questions: [{ prompt: 'Need parent?', allowFreeText: false, options: ['a'] }],
+    });
+    expect(asked.ok).toBe(true);
+    const qId = store.getTask(childId)?.pendingParentQuestion?.questionId;
+    expect(qId).toBeTruthy();
+    expect(store.getTask('coord')?.pendingChildQuestions?.[qId!]).toBeTruthy();
+
+    const cancelled = await engine.handleToolCall(ctx, 'cancel_tasks', {
+      kind: 'cancel_tasks',
+      opId: 'op-can-q',
+      childIds: [childId],
+    });
+    expect(cancelled.ok).toBe(true);
+    expect(store.getTask(childId)?.lifecycle).toBe('cancelled');
+    expect(store.getTask(childId)?.pendingParentQuestion).toBeUndefined();
+    expect(store.getTask('coord')?.pendingChildQuestions?.[qId!]).toBeUndefined();
+    expect(store.getTask('coord')?.attention?.code).not.toBe('child_question');
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('C5: cancel clears routed ask_parent on open ancestor when direct parent terminal', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'root',
+      goal: 'root',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'cancel_child', 'wait_child'],
+    });
+    const rootStarted = engine.startTask('root');
+    if (!rootStarted.ok) return;
+    const rootTurnId = rootStarted.value.turnId;
+    await waitTurnRunning(store, rootTurnId);
+    // Terminal mid under open root so ask_parent routes to ancestor.
+    store.commit((draft) => {
+      const policy = {
+        maxTurns: 10,
+        maxAutomaticRetries: 0,
+        turnTimeoutMs: 60_000,
+        taskTimeoutMs: 120_000,
+      };
+      draft.tasks.mid = {
+        id: 'mid',
+        role: 'coordinator',
+        lifecycle: 'succeeded',
+        goal: 'mid',
+        parentId: 'root',
+        dependencies: [],
+        backend: 'grok',
+        capabilities: ['create_child', 'cancel_child'],
+        executionPolicy: policy,
+        releaseState: 'released',
+        finishedAt: '2026-07-06T12:00:00.000Z',
+        revision: 1,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.tasks.leaf = {
+        id: 'leaf',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'leaf',
+        parentId: 'mid',
+        dependencies: [],
+        backend: 'grok',
+        capabilities: [],
+        executionPolicy: policy,
+        releaseState: 'released',
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.turns['leaf-turn-1'] = {
+        id: 'leaf-turn-1',
+        taskId: 'leaf',
+        sequence: 1,
+        status: 'running',
+        trigger: 'engine',
+        inputs: [],
+        createdAt: '2026-07-06T12:00:00.000Z',
+        startedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+    const childToken = credentials.issue({
+      rootId: 'root',
+      callerTaskId: 'leaf',
+      turnId: 'leaf-turn-1',
+      allowedActions: new Set(['ask_parent']),
+      ttlMs: 60_000,
+    });
+    const childCtx = credentials.verify(childToken)!;
+    const asked = await engine.handleToolCall(childCtx, 'ask_parent', {
+      kind: 'ask_parent',
+      opId: 'op-q-route',
+      questions: [{ prompt: 'Need ancestor?', allowFreeText: false, options: ['a'] }],
+    });
+    expect(asked.ok).toBe(true);
+    const qId = store.getTask('leaf')?.pendingParentQuestion?.questionId;
+    expect(qId).toBeTruthy();
+    // Question should land on open root ancestor, not only terminal mid.
+    expect(store.getTask('root')?.pendingChildQuestions?.[qId!]).toBeTruthy();
+    expect(store.getTask('root')?.attention?.code).toBe('child_question');
+
+    const cancelled = engine.cancelTask('leaf');
+    expect(cancelled.ok).toBe(true);
+    expect(store.getTask('leaf')?.pendingParentQuestion).toBeUndefined();
+    expect(store.getTask('root')?.pendingChildQuestions?.[qId!]).toBeUndefined();
+    expect(store.getTask('root')?.attention?.code).not.toBe('child_question');
+    expect(store.getTask('mid')?.pendingChildQuestions?.[qId!]).toBeUndefined();
+    engine.stageDisposition(rootTurnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('C5: host cancelTask clears pending ask_parent and parent inbound', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'cancel_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_task', 'wait_for_tasks', 'cancel_tasks', 'cancel_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const delegated = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-ask-host-can',
+      waitForCompletion: true,
+      spec: { goal: 'work', taskType: 'worker' },
+    });
+    expect(delegated.ok).toBe(true);
+    const childId = deriveEntityId(turnId, 'op-ask-host-can', 'task');
+    let childTurn = Object.values(store.getFile().turns).find(
+      (t) => t.taskId === childId && t.sequence === 1,
+    );
+    for (let i = 0; i < 50 && !childTurn; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      childTurn = Object.values(store.getFile().turns).find(
+        (t) => t.taskId === childId && t.sequence === 1,
+      );
+    }
+    expect(childTurn).toBeTruthy();
+    for (let i = 0; i < 50 && store.getFile().turns[childTurn!.id]?.status !== 'running'; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const childToken = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: childId,
+      turnId: childTurn!.id,
+      allowedActions: new Set(['ask_parent']),
+      ttlMs: 60_000,
+    });
+    const childCtx = credentials.verify(childToken)!;
+    const asked = await engine.handleToolCall(childCtx, 'ask_parent', {
+      kind: 'ask_parent',
+      opId: 'op-q-host-can',
+      questions: [{ prompt: 'Need parent?', allowFreeText: false, options: ['a'] }],
+    });
+    expect(asked.ok).toBe(true);
+    const qId = store.getTask(childId)?.pendingParentQuestion?.questionId;
+    expect(qId).toBeTruthy();
+    expect(store.getTask('coord')?.pendingChildQuestions?.[qId!]).toBeTruthy();
+
+    const cancelled = engine.cancelTask(childId);
+    expect(cancelled.ok).toBe(true);
+    expect(store.getTask(childId)?.lifecycle).toBe('cancelled');
+    expect(store.getTask(childId)?.pendingParentQuestion).toBeUndefined();
+    expect(store.getTask('coord')?.pendingChildQuestions?.[qId!]).toBeUndefined();
+    expect(store.getTask('coord')?.attention?.code).not.toBe('child_question');
     engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
     resume();
     await engine.whenIdle();

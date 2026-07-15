@@ -30,5 +30,7 @@ jobs:
       - run: npm run test:evidence
       - run: npm run test:source-boundary:fixtures
       - run: npm run test:settings-docs
+      - run: npm run compile
+      - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium
       - run: npm run test:webview

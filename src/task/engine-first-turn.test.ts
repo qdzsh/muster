@@ -33,7 +33,6 @@ const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
-  supportsLiveInput: false,
 };
 
 const hostSnap = (overrides: Partial<HostEnvironmentSnapshot> = {}): HostEnvironmentSnapshot => ({

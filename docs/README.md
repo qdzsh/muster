@@ -12,10 +12,15 @@ Read in this order when onboarding:
 |-----|--------|
 | [SESSION-MANAGEMENT.md](SESSION-MANAGEMENT.md) | Explicit session IDs, resume flow |
 | [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) | Task/turn domain model, coordinator protocol, TaskEngine lifecycle, and task Markdown export contract |
-| [plans/task-orchestration-auto-run.md](plans/task-orchestration-auto-run.md) | **APPROVED** plan: brief/result/release auto-run, dataflow, attention, readiness (Phase F) |
-| [plans/coordinator-host-context-and-seal.md](plans/coordinator-host-context-and-seal.md) | **APPROVED** plan: host context inject, rich create/delegate, parent `set_task_lifecycle`, wait-queue UX (W0–W6) |
+| [plans/task-orchestration-auto-run.md](plans/task-orchestration-auto-run.md) | **PARTIAL**: brief/result/release auto-run (cleanup gate pending) |
+| [plans/coordinator-host-context-and-seal.md](plans/coordinator-host-context-and-seal.md) | **IMPLEMENTED**: host context inject, rich create/delegate, parent seal, wait-queue UX (W0–W6) |
+| [plans/cleanup-legacy-debt.md](plans/cleanup-legacy-debt.md) | **PARTIAL** (2026-07-15): kill live-inject debt, plan status honesty, MCP/docs hygiene |
+| [plans/interrupt-and-send-queue-refactor.md](plans/interrupt-and-send-queue-refactor.md) | **PARTIAL**: interrupt & send; concurrent inject removed (cleanup gate pending) |
+| [plans/task-chat-turn-hide-cli.md](plans/task-chat-turn-hide-cli.md) | **PARTIAL**: Task/Turn activity; no CLI product chrome (cleanup gate pending) |
+| [plans/rfd-elicitation-full.md](plans/rfd-elicitation-full.md) | **PARTIAL**: full ACP RFD elicitation (C4 AC audit pending) |
+| [plans/delegate-task-ux-improve.md](plans/delegate-task-ux-improve.md) | **PARTIAL**: compound wait, repair, ask_parent; C5 residuals under cleanup |
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
-| [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | MCP `ask_user`, AskBridge, tool catalog |
+| [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | Bridge / elicitation (MCP `ask_user` disabled — see cleanup C3) |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, and diagnostics |
 | [SETTINGS.md](SETTINGS.md) | Host-backed Settings pattern for feature configuration |
 
