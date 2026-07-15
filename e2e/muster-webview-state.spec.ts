@@ -1727,6 +1727,544 @@ test('file mention autocomplete keyboard mouse IME and caret interactions', asyn
   expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
 });
 
+test('accessible file mention keyboard flow', async ({ page }) => {
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+  page.on('console', (msg) => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (/status of 403|Failed to load resource/i.test(text)) return;
+    consoleErrors.push(text);
+  });
+  page.on('pageerror', (err) => {
+    pageErrors.push(err.message);
+  });
+  page.on('requestfailed', (req) => {
+    const failure = req.failure()?.errorText ?? '';
+    if (/403|ERR_ABORTED|net::ERR/i.test(failure) || /403/.test(req.url())) return;
+    failedRequests.push(`${req.method()} ${req.url()} ${failure}`);
+  });
+
+  await openWebview(page);
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 50 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await composer.click();
+  await expect(composer).toBeFocused();
+
+  // Closed baseline: combobox-like list semantics present, popup collapsed.
+  await expect(composer).toHaveAttribute('aria-autocomplete', 'list');
+  await expect(composer).toHaveAttribute('aria-haspopup', 'listbox');
+  await expect(composer).toHaveAttribute('aria-expanded', 'false');
+  await expect(composer).not.toHaveAttribute('aria-activedescendant');
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // ── Type @ and open listbox: full accessibility contract ──
+  await composer.pressSequentially('Review @ac', { delay: 15 });
+  const openBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(openBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const openRequest = (await postedMessages(page))
+    .slice(openBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    relativeQuery: string;
+    parentDepth: number;
+  };
+  expect(openRequest.relativeQuery).toBe('ac');
+  expect(openRequest.parentDepth).toBe(0);
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: openRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'ac',
+    items: [
+      {
+        id: 'file:access.md',
+        kind: 'file',
+        label: 'access.md',
+        insertionPath: 'docs/access.md',
+      },
+      {
+        id: 'file:actions.ts',
+        kind: 'file',
+        label: 'actions.ts',
+        insertionPath: 'src/actions.ts',
+      },
+      {
+        id: 'dir:accounts',
+        kind: 'directory',
+        label: 'accounts',
+        insertionPath: 'accounts',
+      },
+    ],
+  });
+
+  const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(listbox).toBeVisible();
+  await expect(listbox).toHaveAttribute('id', 'file-mention-listbox');
+  await expect(listbox).toHaveAttribute('data-testid', 'file-mention-listbox');
+  await expect(listbox).toHaveAttribute('data-outcome', 'ready');
+  await expect(listbox).toHaveAttribute('role', 'listbox');
+  await expect(listbox).toHaveAttribute('aria-label', 'File mention suggestions');
+
+  // Textarea remains focused; listbox is controlled via aria-activedescendant.
+  await expect(composer).toBeFocused();
+  await expect(composer).toHaveAttribute('aria-expanded', 'true');
+  await expect(composer).toHaveAttribute('aria-controls', 'file-mention-listbox');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
+
+  const options = listbox.getByRole('option');
+  await expect(options).toHaveCount(3);
+  await expect(options.nth(0)).toHaveAttribute('id', 'file-mention-option-0');
+  await expect(options.nth(0)).toHaveAttribute('aria-selected', 'true');
+  await expect(options.nth(0)).toHaveAttribute('data-testid', 'file-mention-option');
+  await expect(options.nth(1)).toHaveAttribute('aria-selected', 'false');
+  await expect(options.nth(2)).toHaveAttribute('aria-selected', 'false');
+  // Directory option exposes trailing slash in accessible name.
+  await expect(options.nth(2)).toHaveAttribute('aria-label', 'accounts/');
+
+  // ── ArrowDown / ArrowUp move active option with aria-activedescendant ──
+  await composer.press('ArrowDown');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await expect(options.nth(1)).toHaveAttribute('aria-selected', 'true');
+  await expect(options.nth(0)).toHaveAttribute('aria-selected', 'false');
+  await expect(composer).toBeFocused();
+
+  await composer.press('ArrowDown');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-2');
+  await expect(options.nth(2)).toHaveAttribute('aria-selected', 'true');
+
+  await composer.press('ArrowUp');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await expect(options.nth(1)).toHaveAttribute('aria-selected', 'true');
+
+  // Mouse hover also drives the same active option path.
+  await options.nth(0).hover();
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
+  await expect(options.nth(0)).toHaveAttribute('aria-selected', 'true');
+  await expect(composer).toBeFocused();
+
+  // ── Enter accepts active option; does not send ──
+  const beforeEnter = (await postedMessages(page)).length;
+  await composer.press('Enter');
+  await expect(listbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Review @access.md ');
+  await expect(composer).toBeFocused();
+  await expect(composer).toHaveAttribute('aria-expanded', 'false');
+  await expect(composer).not.toHaveAttribute('aria-activedescendant');
+  expect(
+    (await postedMessages(page))
+      .slice(beforeEnter)
+      .some((m) => (m as { type?: string }).type === 'send'),
+  ).toBe(false);
+
+  // Ordinary Enter after popup close resumes send.
+  await composer.press('Enter');
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Review @access.md',
+    llmText: 'Review @docs/access.md',
+    backend: 'claude',
+  });
+
+  // ── Mid-sentence caret replacement via mouse ──
+  await composer.fill('');
+  await composer.pressSequentially('See @fi before after', { delay: 12 });
+  await composer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(7, 7));
+  await composer.dispatchEvent('select');
+
+  const midBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(midBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const midRequest = (await postedMessages(page))
+    .slice(midBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    relativeQuery: string;
+  };
+  expect(midRequest.relativeQuery).toBe('fi');
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: midRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'fi',
+    items: [
+      {
+        id: 'file:file.ts',
+        kind: 'file',
+        label: 'file.ts',
+        insertionPath: 'src/file.ts',
+      },
+      {
+        id: 'file:filter.ts',
+        kind: 'file',
+        label: 'filter.ts',
+        insertionPath: 'filter.ts',
+      },
+    ],
+  });
+  const midListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(midListbox).toBeVisible();
+  await expect(composer).toHaveAttribute('aria-expanded', 'true');
+  await midListbox.getByRole('option', { name: 'file.ts' }).click();
+  await expect(midListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('See @file.ts before after');
+  await expect(composer).toBeFocused();
+
+  // ── Tab accept after Arrow navigation ──
+  await composer.fill('');
+  await composer.pressSequentially('Pick @ta', { delay: 12 });
+  const tabBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(tabBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const tabRequest = (await postedMessages(page))
+    .slice(tabBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: tabRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'ta',
+    items: [
+      {
+        id: 'file:task.md',
+        kind: 'file',
+        label: 'task.md',
+        insertionPath: 'task.md',
+      },
+      {
+        id: 'file:table.md',
+        kind: 'file',
+        label: 'table.md',
+        insertionPath: 'table.md',
+      },
+    ],
+  });
+  const tabListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(tabListbox).toBeVisible();
+  await composer.press('ArrowDown');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await expect(tabListbox.getByRole('option').nth(1)).toHaveAttribute('aria-selected', 'true');
+  await composer.press('Tab');
+  await expect(tabListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Pick @table.md ');
+  await expect(composer).toBeFocused();
+
+  // ── Escape dismisses without insert; draft + collapsed ARIA preserved ──
+  await composer.fill('');
+  await composer.pressSequentially('Keep @esc', { delay: 12 });
+  const escBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(escBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const escRequest = (await postedMessages(page))
+    .slice(escBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: escRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'esc',
+    items: [
+      {
+        id: 'file:escape.md',
+        kind: 'file',
+        label: 'escape.md',
+        insertionPath: 'escape.md',
+      },
+    ],
+  });
+  const escListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(escListbox).toBeVisible();
+  await composer.press('Escape');
+  await expect(escListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Keep @esc');
+  await expect(composer).toHaveAttribute('aria-expanded', 'false');
+  await expect(composer).not.toHaveAttribute('aria-activedescendant');
+
+  // ── Email-like text never opens suggestions ──
+  await composer.fill('');
+  const emailBefore = (await postedMessages(page)).length;
+  await composer.pressSequentially('user@example.com', { delay: 8 });
+  await page.waitForTimeout(180);
+  expect(
+    (await postedMessages(page))
+      .slice(emailBefore)
+      .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions'),
+  ).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+  await expect(composer).toHaveAttribute('aria-expanded', 'false');
+
+  // ── IME composition suppresses open/request ──
+  await composer.fill('');
+  await composer.click();
+  const imeBefore = (await postedMessages(page)).length;
+  await composer.evaluate((el: HTMLTextAreaElement) => {
+    el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+    el.value = 'こんにちは@re';
+    el.dispatchEvent(
+      new InputEvent('input', { bubbles: true, data: 'こんにちは@re', isComposing: true }),
+    );
+    el.setSelectionRange(el.value.length, el.value.length);
+    el.dispatchEvent(
+      new CompositionEvent('compositionupdate', { bubbles: true, data: 'こんにちは@re' }),
+    );
+  });
+  await page.waitForTimeout(180);
+  expect(
+    (await postedMessages(page))
+      .slice(imeBefore)
+      .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions'),
+  ).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+  await composer.evaluate((el: HTMLTextAreaElement) => {
+    el.dispatchEvent(
+      new CompositionEvent('compositionend', { bubbles: true, data: 'こんにちは@re' }),
+    );
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+
+  // ── Empty results: status role + draft preserved ──
+  await composer.fill('');
+  await composer.pressSequentially('Empty @zz', { delay: 12 });
+  const emptyBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(emptyBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const emptyRequest = (await postedMessages(page))
+    .slice(emptyBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: emptyRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'zz',
+    items: [],
+  });
+  const emptyListbox = page.getByTestId('file-mention-listbox');
+  await expect(emptyListbox).toBeVisible();
+  await expect(emptyListbox).toHaveAttribute('data-outcome', 'empty');
+  const emptyStatus = page.getByTestId('file-mention-status');
+  await expect(emptyStatus).toHaveText('No matching files');
+  await expect(emptyStatus).toHaveAttribute('role', 'status');
+  await expect(emptyStatus).toHaveAttribute('aria-live', 'polite');
+  await expect(composer).toHaveValue('Empty @zz');
+  await expect(composer).toHaveAttribute('aria-expanded', 'true');
+  // No selectable options while empty; Enter must not send.
+  await expect(emptyListbox.getByRole('option')).toHaveCount(0);
+  const emptyEnterBefore = (await postedMessages(page)).length;
+  await composer.press('Enter');
+  expect(
+    (await postedMessages(page))
+      .slice(emptyEnterBefore)
+      .some((m) => (m as { type?: string }).type === 'send'),
+  ).toBe(false);
+  await composer.press('Escape');
+  await expect(emptyListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Empty @zz');
+
+  // ── Sanitized host error: bounded status, no codes/paths ──
+  await composer.fill('');
+  await composer.pressSequentially('Fail @er', { delay: 12 });
+  const errBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(errBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const errRequest = (await postedMessages(page))
+    .slice(errBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    ok: false,
+    requestId: errRequest.requestId,
+    code: 'listingFailed',
+  });
+  const errListbox = page.getByTestId('file-mention-listbox');
+  await expect(errListbox).toBeVisible();
+  await expect(errListbox).toHaveAttribute('data-outcome', 'error');
+  await expect(page.getByTestId('file-mention-status')).toHaveText('File suggestions unavailable');
+  await expect(composer).toHaveValue('Fail @er');
+  await expect(page.locator('body')).not.toContainText('listingFailed');
+  await expect(page.locator('body')).not.toContainText('/Users');
+  await expect(page.locator('body')).not.toContainText('C:\\');
+  await composer.press('Escape');
+  await expect(errListbox).toHaveCount(0);
+
+  // ── Task change closes suggestions and collapses ARIA ──
+  await composer.fill('');
+  await composer.pressSequentially('Scope @ch', { delay: 12 });
+  const taskChangeBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskChangeBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const taskChangeRequest = (await postedMessages(page))
+    .slice(taskChangeBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskChangeRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'ch',
+    items: [
+      {
+        id: 'file:change.md',
+        kind: 'file',
+        label: 'change.md',
+        insertionPath: 'change.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toBeVisible();
+  await expect(composer).toHaveAttribute('aria-expanded', 'true');
+
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-a11y-switch',
+        goal: 'Task change closes accessible mention popup',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-a11y-switch',
+    subtree: [
+      task({
+        id: 'task-a11y-switch',
+        goal: 'Task change closes accessible mention popup',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-a11y-switch', kind: 'assistant', content: 'Ready after a11y switch.' }],
+    storeRevision: 51,
+  });
+  await expect(page.getByText('Ready after a11y switch.')).toBeVisible();
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // ── Blocked composer (pending ask) closes suggestions ──
+  const taskComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskComposer).toBeEnabled();
+  await taskComposer.click();
+  await taskComposer.pressSequentially('Block @bl', { delay: 12 });
+  const blockBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(blockBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const blockRequest = (await postedMessages(page))
+    .slice(blockBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    taskId?: string;
+  };
+  expect(blockRequest.taskId).toBe('task-a11y-switch');
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: blockRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'bl',
+    items: [
+      {
+        id: 'file:block.md',
+        kind: 'file',
+        label: 'block.md',
+        insertionPath: 'block.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toBeVisible();
+  await expect(taskComposer).toHaveAttribute('aria-expanded', 'true');
+
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-a11y-switch',
+        goal: 'Task change closes accessible mention popup',
+        viewStatus: 'waiting_user',
+      }),
+    ],
+    focusedTaskId: 'task-a11y-switch',
+    subtree: [
+      task({
+        id: 'task-a11y-switch',
+        goal: 'Task change closes accessible mention popup',
+        viewStatus: 'waiting_user',
+      }),
+    ],
+    transcript: [{ id: 'msg-a11y-switch', kind: 'assistant', content: 'Ready after a11y switch.' }],
+    activeTurnId: 'turn-a11y-block',
+    pendingAsk: {
+      turnId: 'turn-a11y-block',
+      askId: 'ask-a11y-block',
+      questions: [{ prompt: 'Continue?', options: ['Yes', 'No'], allowFreeText: false }],
+    },
+    storeRevision: 52,
+  });
+  await expect(page.getByText('Answer above to continue.')).toBeVisible();
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+  expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+  expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+});
 test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 
