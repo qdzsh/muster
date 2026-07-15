@@ -4196,7 +4196,6 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await expect(page.getByText('Backed by VS Code configuration')).toBeVisible();
     await expect(page.getByText('Retention keeps recent task history usable without storing unlimited completed-turn output.')).toBeVisible();
     await expect(page.getByRole('status').getByText('Loading retention settings from VS Code…')).toBeVisible();
     // Full-view Settings replaces the task list (not an overlay).
@@ -4227,22 +4226,19 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       },
     });
 
-    await expect(
-      page
-        .getByRole('status')
-        .getByText('Edit one retention field at a time; each Save writes only that VS Code setting.'),
-    ).toBeVisible();
-    await expect(page.getByLabel('Maximum turns per task')).toHaveValue('200');
-    await expect(page.getByLabel('Maximum stored output characters')).toHaveValue('200000');
-    await expect(page.getByText('Minimum 1. Default 200.')).toBeVisible();
-    await expect(page.getByText('Minimum 1024. Default 200000.')).toBeVisible();
+    // Once the snapshot loads, the loading status is replaced by the editable fields.
+    await expect(page.getByText('Loading retention settings from VS Code…')).toHaveCount(0);
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('200');
+    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue('200000');
+    await expect(page.getByText('Min 1 · Default 200')).toBeVisible();
+    await expect(page.getByText('Min 1024 · Default 200000')).toBeVisible();
 
-    await page.getByLabel('Maximum turns per task').fill('0');
+    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('0');
     await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
     await expect(page.getByRole('alert').getByText('Maximum turns per task must be at least 1.')).toBeVisible();
     await expect.poll(async () => (await postedMessages(page)).filter((message) => (message as { type?: string }).type === 'updateSetting')).toHaveLength(0);
 
-    await page.getByLabel('Maximum turns per task').fill('201');
+    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('201');
     await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
     await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 201 });
     await expect(page.getByText('Saving Maximum turns per task…')).toBeVisible();
@@ -4251,10 +4247,10 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       type: 'settingsUpdateResult',
       result: { ok: true, settingId: 'maxTurnsPerTask', value: 201 },
     });
-    await expect(page.getByLabel('Maximum turns per task')).toHaveValue('201');
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('201');
     await expect(page.getByText('Saved Maximum turns per task.')).toBeVisible();
 
-    await page.getByLabel('Maximum stored output characters').fill('250000');
+    await page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true }).fill('250000');
     await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
     await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxStoredOutputChars', value: 250000 });
     await postRawHostMessage(page, {
@@ -4269,7 +4265,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByRole('alert').getByText('Settings save failed')).toBeVisible();
     await expect(page.getByRole('alert').getByText('Unable to save Maximum stored output characters. Check the VS Code setting and try again.')).toBeVisible();
     await expect(page.getByText('leaked stack trace')).toHaveCount(0);
-    await expect(page.getByLabel('Maximum stored output characters')).toHaveValue('200000');
+    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue('200000');
 
     await page.setViewportSize({ width: 360, height: 720 });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
