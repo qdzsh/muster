@@ -5003,6 +5003,8 @@ test.describe('Owning-root task tree navigation', () => {
     await expect(page.getByTestId('task-chrome')).toBeVisible();
     await expect(page.getByTestId('task-tree-parent')).toBeVisible();
     await expect(page.getByTestId('export-task-chat')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
+    await expect(page.getByTestId('task-chrome').getByRole('button', { name: /Task status:/i })).toBeVisible();
     // Breadcrumb hidden at narrow width (display:none).
     await expect(page.getByTestId('task-tree-breadcrumb')).toBeHidden();
 

@@ -146,13 +146,6 @@
     post({ type: 'setTaskLifecycle', taskId: focused.id, lifecycle });
   }
 
-  /** Request host Markdown export for the focused task only (native Save As). */
-  function exportTaskChat(): void {
-    if (!focused) return;
-    tasks.setCommandError(null);
-    post({ type: 'exportTask', taskId: focused.id });
-  }
-
   $effect(() => {
     if (!statusMenuOpen) return;
     function onPointerDown(e: PointerEvent) {
@@ -475,37 +468,6 @@
         {#if focused.backend}
           <span class="task-pill task-pill--muted shrink-0">{focused.backend}</span>
         {/if}
-        <button
-          type="button"
-          class="icon-btn shrink-0"
-          style="width: 22px; height: 22px;"
-          aria-label="Export task/chat"
-          data-testid="export-task-chat"
-          use:tip={'Export task/chat'}
-          onclick={exportTaskChat}
-        >
-          <span class="codicon codicon-export" style="font-size: 14px;"></span>
-        </button>
-        {#if showTaskNav}
-          <button
-            type="button"
-            class="icon-btn shrink-0"
-            style="width: 22px; height: 22px;"
-            aria-label={treeExpanded ? 'Collapse task tree' : 'Expand task tree'}
-            aria-expanded={treeExpanded ? 'true' : 'false'}
-            aria-controls="task-chrome-tree"
-            data-testid="task-chrome-expand"
-            use:tip={treeExpanded ? 'Collapse task tree' : 'Expand task tree'}
-            onclick={toggleTreeExpanded}
-          >
-            <span
-              class="codicon"
-              class:codicon-chevron-up={treeExpanded}
-              class:codicon-chevron-down={!treeExpanded}
-              style="font-size: 14px;"
-            ></span>
-          </button>
-        {/if}
       </div>
 
       {#if showTaskNav}
@@ -567,10 +529,18 @@
             aria-expanded={treeExpanded ? 'true' : 'false'}
             aria-controls="task-chrome-tree"
             aria-label={`${treeSummaryLabel}. ${treeExpanded ? 'Collapse' : 'Expand'} current task tree.`}
+            use:tip={treeExpanded ? 'Collapse task tree' : 'Expand task tree'}
             onclick={toggleTreeExpanded}
           >
             <span class="codicon codicon-list-tree" aria-hidden="true"></span>
             <span class="task-tree-nav__summary-label">{treeSummaryLabel}</span>
+            <span
+              class="codicon"
+              class:codicon-chevron-up={treeExpanded}
+              class:codicon-chevron-down={!treeExpanded}
+              style="font-size: 11px; opacity: 0.75;"
+              aria-hidden="true"
+            ></span>
           </button>
         </div>
       {/if}

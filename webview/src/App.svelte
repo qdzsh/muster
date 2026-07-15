@@ -742,6 +742,23 @@
         type="button"
         class="icon-btn"
         style="width: 22px; height: 22px;"
+        aria-label="Export task/chat"
+        data-testid="export-task-chat"
+        use:tip={'Export task/chat'}
+        disabled={!tasks.focusedTaskId}
+        onclick={() => {
+          if (!tasks.focusedTaskId) return;
+          tasks.setCommandError(null);
+          post({ type: 'exportTask', taskId: tasks.focusedTaskId });
+        }}
+      >
+        <span class="codicon codicon-export"></span>
+      </button>
+
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
         onclick={openSettings}
         aria-label="Settings"
         aria-pressed={settingsOpen}
