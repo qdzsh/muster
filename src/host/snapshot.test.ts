@@ -963,4 +963,48 @@ describe('host task snapshot projection', () => {
     expect(progressJson).not.toContain('sessionId');
   });
 
+  it('P2: coordinator TaskSummary includes childOrchestration aggregate', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        coord: task('coord', { role: 'coordinator', goal: 'root' }),
+        c1: task('c1', {
+          parentId: 'coord',
+          role: 'worker',
+          lifecycle: 'open',
+          attention: {
+            code: 'disposition_repair_pending',
+            message: 'repair',
+            at: '2026-07-06T00:00:00.000Z',
+          },
+        }),
+        c2: task('c2', {
+          parentId: 'coord',
+          role: 'worker',
+          lifecycle: 'succeeded',
+        }),
+      },
+      turns: {
+        t1: turn({
+          id: 't1',
+          taskId: 'c1',
+          status: 'running',
+          sequence: 1,
+        }),
+      },
+      messages: {},
+    };
+    const summary = projectTaskSummary(file, 'coord');
+    expect(summary?.childOrchestration).toMatchObject({
+      total: 2,
+      running: 1,
+      open: 1,
+      terminal: 1,
+      repairPending: 1,
+    });
+    expect(summary?.childOrchestration?.label).toContain('running');
+    expect(projectTaskSummary(file, 'c1')).not.toHaveProperty('childOrchestration');
+  });
+
 });

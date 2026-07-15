@@ -97,6 +97,19 @@ export interface TaskSummary {
    * or summary/bootstrap bodies — those stay off TaskSummary and chat.
    */
   handoffProgress?: HandoffProgress;
+  /**
+   * Aggregate direct-child orchestration chrome for coordinators (P2).
+   * Omitted when there are no children.
+   */
+  childOrchestration?: {
+    total: number;
+    running: number;
+    open: number;
+    terminal: number;
+    repairPending: number;
+    needsParentInput: number;
+    label: string;
+  };
 }
 
 export interface ToolTranscriptContent {
@@ -362,6 +375,57 @@ export function projectHandoffProgress(
   return progress;
 }
 
+function projectChildOrchestration(
+  file: TaskStoreFile,
+  parentId: string,
+): TaskSummary['childOrchestration'] | undefined {
+  const children = Object.values(file.tasks).filter((t) => t.parentId === parentId);
+  if (children.length === 0) return undefined;
+  let running = 0;
+  let open = 0;
+  let terminal = 0;
+  let repairPending = 0;
+  let needsParentInput = 0;
+  for (const child of children) {
+    if (
+      child.lifecycle === 'succeeded' ||
+      child.lifecycle === 'failed' ||
+      child.lifecycle === 'cancelled' ||
+      child.lifecycle === 'skipped'
+    ) {
+      terminal += 1;
+    } else {
+      open += 1;
+      const live = turnsForTask(file, child.id).some(
+        (t) => t.status === 'running' || t.status === 'waiting_user',
+      );
+      if (live) running += 1;
+    }
+    if (child.attention?.code === 'disposition_repair_pending') repairPending += 1;
+    if (
+      child.attention?.code === 'awaiting_parent_answer' ||
+      child.pendingParentQuestion
+    ) {
+      needsParentInput += 1;
+    }
+  }
+  const parts: string[] = [];
+  if (running > 0) parts.push(`${running} running`);
+  if (open - running > 0) parts.push(`${open - running} open`);
+  if (terminal > 0) parts.push(`${terminal} done`);
+  if (repairPending > 0) parts.push(`${repairPending} disposition retry`);
+  if (needsParentInput > 0) parts.push(`${needsParentInput} need input`);
+  return {
+    total: children.length,
+    running,
+    open,
+    terminal,
+    repairPending,
+    needsParentInput,
+    label: parts.length > 0 ? parts.join(' · ') : `${children.length} children`,
+  };
+}
+
 export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSummary | undefined {
   const task = file.tasks[taskId];
   if (!task) {
@@ -370,6 +434,8 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   const turns = turnsForTask(file, taskId);
   const deps = depLifecyclesForTask(file, task);
   const handoffProgress = projectHandoffProgress(task.handoff);
+  const childOrchestration =
+    task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
   return {
     id: task.id,
     parentId: task.parentId,
@@ -385,6 +451,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     model: task.model,
     continuationOf: task.continuationOf,
     ...(handoffProgress ? { handoffProgress } : {}),
+    ...(childOrchestration ? { childOrchestration } : {}),
   };
 }
 
